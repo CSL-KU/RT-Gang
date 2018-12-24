@@ -1,3 +1,17 @@
+diff -ruN linux/include/linux/sched.h /ssd/work/linux/kernel/kernel-4.4/include/linux/sched.h
+--- linux/include/linux/sched.h	2017-07-20 07:41:24.000000000 +0000
++++ /ssd/work/linux/kernel/kernel-4.4/include/linux/sched.h	2018-01-13 14:52:14.966137561 +0000
+@@ -1416,6 +1416,10 @@
+ #endif
+ 	struct sched_dl_entity dl;
+ 
++	/* BWLOCK++ Related Fields */
++	int bwlock_val;
++	int bw_old_prio;
++
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* list of struct preempt_notifier: */
+ 	struct hlist_head preempt_notifiers;
 diff -ruN linux/include/linux/syscalls.h /ssd/work/linux/kernel/kernel-4.4/include/linux/syscalls.h
 --- linux/include/linux/syscalls.h	2017-07-20 07:41:24.000000000 +0000
 +++ /ssd/work/linux/kernel/kernel-4.4/include/linux/syscalls.h	2018-01-13 14:53:36.237525103 +0000
