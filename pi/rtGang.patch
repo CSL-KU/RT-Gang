@@ -1,0 +1,359 @@
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 0552ddbb2..8aa5b39c4 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -511,6 +511,34 @@ void resched_cpu(int cpu)
+ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ }
+ 
++/*
++ * The purpose of this function is to force rescheduling of a target cpu under
++ * all circumstances. For this reason, this function does not acquire the
++ * target CPU's rq lock and sends a rescheduling interrupt without protection
++ * if need be. It is used exclusively in RT-Gang related code.
++ */
++void resched_cpu_force (int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++	struct task_struct *curr = rq->curr;
++
++	if (test_tsk_need_resched(curr))
++		return;
++
++	cpu = cpu_of(rq);
++
++	if (cpu == smp_processor_id()) {
++		set_tsk_need_resched(curr);
++		set_preempt_need_resched();
++		return;
++	}
++
++	if (set_nr_and_not_polling(curr))
++		smp_send_reschedule(cpu);
++	else
++		trace_sched_wake_idle_without_ipi(cpu);
++}
++
+ #ifdef CONFIG_SMP
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+@@ -3217,38 +3245,32 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ {
+ 	const struct sched_class *class;
+ 	struct task_struct *p;
+-
+-	/*
+-	 * Optimization: we know that if all tasks are in the fair class we can
+-	 * call that function directly, but only if the @prev task wasn't of a
+-	 * higher scheduling class, because otherwise those loose the
+-	 * opportunity to pull in more work from other CPUs.
+-	 */
+-	if (likely((prev->sched_class == &idle_sched_class ||
+-		    prev->sched_class == &fair_sched_class) &&
+-		   rq->nr_running == rq->cfs.h_nr_running)) {
+-
+-		p = fair_sched_class.pick_next_task(rq, prev, rf);
+-		if (unlikely(p == RETRY_TASK))
+-			goto again;
+-
+-		/* Assumes fair_sched_class->next == idle_sched_class */
+-		if (unlikely(!p))
+-			p = idle_sched_class.pick_next_task(rq, prev, rf);
+-
+-		return p;
+-	}
++	bool skip_retry_flag = false;
+ 
+ again:
+ 	for_each_class(class) {
+ 		p = class->pick_next_task(rq, prev, rf);
+ 		if (p) {
+-			if (unlikely(p == RETRY_TASK))
+-				goto again;
+-			return p;
+-		}
+-	}
++			if (p == BLOCK_TASK) {
++				/*
++				 * Do not honor the RETRY request from the fair
++				 * class since blocking of task in RT class is
++				 * being done on purpose.
++				 */
++				skip_retry_flag = true;
++				continue;
++			}
++
++			if (p != RETRY_TASK)
++				/* We have a valid task. Return it! */
++				return p;
+ 
++			if (!skip_retry_flag && p == RETRY_TASK)
++				/* Restart the task picking loop */
++ 				goto again;
++ 		}
++ 	}
++ 
+ 	/* The idle class should always have a runnable task: */
+ 	BUG();
+ }
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index 9552fd585..2f1b48369 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -85,3 +85,11 @@ SCHED_FEAT(ATTACH_AGE_LOAD, true)
+ SCHED_FEAT(WA_IDLE, true)
+ SCHED_FEAT(WA_WEIGHT, true)
+ SCHED_FEAT(WA_BIAS, true)
++
++/*
++ * Enable real-time gang scheduling framework (RT-Gang). RT-Gang allows
++ * execution of a single (multi-threaded) real-time task (i.e., gang) at any
++ * giving time across all system cores.
++ * NOTE: This feature is disabled by default.
++ */
++SCHED_FEAT(RT_GANG_LOCK, false)
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index cb9a5b853..be312f2b5 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -9,6 +9,9 @@
+ #include <linux/slab.h>
+ #include <linux/irq_work.h>
+ 
++rt_gang_lock_t	rt_gang_lock;
++rt_gang_lock_t	*rt_glock = &rt_gang_lock;
++
+ int sched_rr_timeslice = RR_TIMESLICE;
+ int sysctl_sched_rr_timeslice = (MSEC_PER_SEC / HZ) * RR_TIMESLICE;
+ 
+@@ -1510,7 +1513,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
+ 	return next;
+ }
+ 
+-static struct task_struct *_pick_next_task_rt(struct rq *rq)
++static struct task_struct *__peek_next_task_rt(struct rq *rq)
+ {
+ 	struct sched_rt_entity *rt_se;
+ 	struct task_struct *p;
+@@ -1523,7 +1526,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+ 	} while (rt_rq);
+ 
+ 	p = rt_task_of(rt_se);
+-	p->se.exec_start = rq_clock_task(rq);
+ 
+ 	return p;
+ }
+@@ -1558,19 +1560,68 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 	 * We may dequeue prev's rt_rq in put_prev_task().
+ 	 * So, we update time before rt_nr_running check.
+ 	 */
+-	if (prev->sched_class == &rt_sched_class)
++	if (prev->sched_class == &rt_sched_class) {
+ 		update_curr_rt(rq);
+ 
++		/*
++		 * If 'prev' is a member of the current RT gang, update the
++		 * locked_cores mask and release the RT gang lock if necessary.
++		 */
++		if (sched_feat (RT_GANG_LOCK)) {
++			raw_spin_lock (&rt_glock->lock);
++			if (rt_glock->lock_held)
++				try_glock_release (prev);
++			raw_spin_unlock (&rt_glock->lock);
++		}
++	}
++
+ 	if (!rt_rq->rt_queued)
+ 		return NULL;
+ 
+-	put_prev_task(rq, prev);
++	p = __peek_next_task_rt (rq);
++
++	/* Do not apply RT gang to high-priority kernel threads */
++	if (sched_feat (RT_GANG_LOCK) && p->mm &&
++			(p->prio > RT_SYS_PRIO_THRESHOLD)) {
++		raw_spin_lock (&rt_glock->lock);
++		if (!rt_glock->lock_held) {
++			/* No RT gang exist currently; begin a new gang */
++			BUG_ON (cpumask_weight (rt_glock->locked_cores) != 0);
++			BUG_ON (cpumask_weight (rt_glock->blocked_cores) != 0);
++
++			TRACER (p, "Acquiring lock");
++			rt_glock->prio = p->prio;
++			gang_lock_cpu (p);
++			rt_glock->lock_held = true;
++		} else {
++			BUG_ON (cpumask_weight (rt_glock->locked_cores) == 0);
++			if (rt_glock->prio > p->prio) {
++				/* 'p' has higher priority; preempt */
++				TRACER (p, "Preempted by gang");
++				do_gang_preemption ();
++				rt_glock->prio = p->prio;
++				gang_lock_cpu (p);
++			} else if (p->prio == rt_glock->prio) {
++				/* 'p' is part of the current RT gang */
++				gang_lock_cpu (p);
++			} else {
++				/* 'p' has lower priority; blocked */
++				TRACER (p, "Blocking gang");
++				cpumask_set_cpu (smp_processor_id (),
++						rt_glock->blocked_cores);
+ 
+-	p = _pick_next_task_rt(rq);
++				raw_spin_unlock (&rt_glock->lock);
++				return BLOCK_TASK;
++			}
++		}
++		raw_spin_unlock (&rt_glock->lock);
++	}
++
++	put_prev_task (rq, prev);
++	p->se.exec_start = rq_clock_task (rq);
+ 
+ 	/* The running task is never eligible for pushing */
+ 	dequeue_pushable_task(rq, p);
+-
+ 	queue_push_tasks(rq);
+ 
+ 	return p;
+@@ -2200,6 +2251,8 @@ void __init init_sched_rt_class(void)
+ 		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
+ 					GFP_KERNEL, cpu_to_node(i));
+ 	}
++
++	INIT_GANG_LOCK ();
+ }
+ #endif /* CONFIG_SMP */
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b3ba6e5e9..d64314f70 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1408,6 +1408,7 @@ extern const u32 sched_prio_to_wmult[40];
+ #endif
+ 
+ #define RETRY_TASK		((void *)-1UL)
++#define BLOCK_TASK		((void *)-2UL)
+ 
+ struct sched_class {
+ 	const struct sched_class *next;
+@@ -1544,6 +1545,7 @@ extern void init_sched_fair_class(void);
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
++extern void resched_cpu_force(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+@@ -2103,3 +2105,111 @@ static inline void cpufreq_update_util(struct rq *rq, unsigned int flags) {}
+ #else /* arch_scale_freq_capacity */
+ #define arch_scale_freq_invariant()	(false)
+ #endif
++
++/*
++ * GANG SCHEDULING RELATED DECLARATIONS
++ */
++typedef struct rt_gang_lock {
++	raw_spinlock_t		lock;
++	bool			lock_held;
++	cpumask_var_t		locked_cores;
++	cpumask_var_t		blocked_cores;
++	int			prio;
++	struct task_struct*	gthreads [NR_CPUS];
++} rt_gang_lock_t;
++
++extern rt_gang_lock_t	*rt_glock;
++
++#define RT_SYS_PRIO_THRESHOLD		(50)
++#define INIT_GANG_LOCK()						\
++do {									\
++	int i = 0;							\
++	raw_spin_lock_init (&rt_glock->lock);				\
++	rt_glock->lock_held = false;					\
++	zalloc_cpumask_var (&rt_glock->locked_cores, GFP_KERNEL);	\
++	zalloc_cpumask_var (&rt_glock->blocked_cores, GFP_KERNEL);	\
++	rt_glock->prio = INT_MAX;					\
++	for (; i < NR_CPUS; i++)					\
++		rt_glock->gthreads [i] = NULL;				\
++} while (0);
++
++#define TRACER(task, msg)						\
++	printk (KERN_INFO "[G:] core=%d task=%-20s prio=%-3d"		\
++			"mm=%p pid=%-6d tcpu=%d | %s\n",		\
++			smp_processor_id (), (task)->comm,		\
++			(task)->prio, (task)->mm, (task)->pid,		\
++			task_cpu (task), msg);
++
++static inline void gang_lock_cpu (struct task_struct *thread)
++{
++	int cpu = smp_processor_id ();
++
++	TRACER (thread, "Adding new gang member");
++	cpumask_set_cpu (cpu, rt_glock->locked_cores);
++	rt_glock->gthreads [cpu] = thread;
++
++	return;
++}
++
++static inline void resched_cpus (cpumask_var_t mask)
++{
++	int cpu;
++	int this_cpu = smp_processor_id ();
++
++	for_each_cpu (cpu, mask) {
++		if (cpu == this_cpu)
++			continue;
++
++		resched_cpu_force (cpu);
++	}
++	return;
++}
++
++static inline void do_gang_preemption (void)
++{
++	int cpu;
++	int this_cpu = smp_processor_id ();
++
++	for_each_cpu (cpu, rt_glock->locked_cores) {
++		WARN_ON (rt_glock->gthreads [cpu] == NULL);
++		TRACER (rt_glock->gthreads [cpu], "Preempting thread");
++		rt_glock->gthreads [cpu] = NULL;
++
++		if (cpu != this_cpu)
++			resched_cpu_force (cpu);
++	}
++
++	cpumask_clear (rt_glock->locked_cores);
++
++	return;
++}
++
++static inline void try_glock_release (struct task_struct *thread)
++{
++	int cpu;
++
++	WARN_ON (cpumask_weight (rt_glock->locked_cores) == 0);
++
++	/*
++	 * Release RT-Gang lock of 'prev' task on all cores it may have ran on.
++	 * Migrated tasks can hold lock on multiple cores.
++	 */
++	for_each_cpu (cpu, rt_glock->locked_cores) {
++		if (rt_glock->gthreads [cpu] == thread) {
++			TRACER (thread, "Releasing lock");
++			WARN_ON (!rt_prio (thread->prio));
++			cpumask_clear_cpu (cpu, rt_glock->locked_cores);
++		}
++	}
++
++	if (cpumask_weight (rt_glock->locked_cores) == 0) {
++		/* RT-Gang lock is now free. Reschedule blocked cores. */
++		TRACER (thread, "Lock free");
++		rt_glock->prio = INT_MAX;
++		rt_glock->lock_held = false;
++		resched_cpus (rt_glock->blocked_cores);
++		cpumask_clear (rt_glock->blocked_cores);
++	}
++
++	return;
++}
