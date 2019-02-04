@@ -1,4 +1,4 @@
-# [Work-in-Progress] RT-Gang: Real-Time Gang Scheduling for Safety Critical Systems
+# RT-Gang: Real-Time Gang Scheduling for Safety Critical Systems
 RT-Gang adds the ability to schedule one (parallel) real-time task across all cores of a multicore platform at any given time. It has been developed as a scheduling feature in the Linux kernel. This repository contains the following materials related to RT-Gang:
 - Linux kernel patches for the supported platforms
   - Jetson TX-2
