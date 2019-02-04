@@ -34,8 +34,8 @@ sudo apt install trace-cmd kernelshark
 
 5. Build BWLOCK kernel module and user-application.
 > NOTE: The script used for this experiment **assumes** that BWLOCK can be
-via the relative path from *this folder* to the *throttling* folder as per the
-default locations of these folders in this repository.
+found via the relative path from *this folder* to the *throttling* folder as
+per the default locations of these folders in this repository.
 
 6. Place the platform in the maximum performance mode. The script
    [max\_perf.sh](../max_perf.sh) can be used for this purpose.
@@ -51,7 +51,7 @@ default locations of these folders in this repository.
 ## Experiment
 Once the setup is complete, performing the actual experiment is straight-forward:
 ```
-./fig5.sh
+. fig5.sh
 ```
 
 Once the experiment is complete, please do the following:
