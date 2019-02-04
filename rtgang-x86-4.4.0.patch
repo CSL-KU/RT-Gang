@@ -1,5 +1,60 @@
+diff --git a/Makefile b/Makefile
+index 70dea02f1346..e1ba92b31cbd 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+ SUBLEVEL = 0
+-EXTRAVERSION =
++EXTRAVERSION = -RTGv1
+ NAME = Blurry Fish Butt
+ 
+ # *DOCUMENTATION*
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index fa39434e3fdd..50e432f9835e 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -1403,6 +1403,10 @@ struct task_struct {
+ #endif
+ 	struct sched_dl_entity dl;
+ 
++	/* BWLOCK++ Related Fields */
++	int bwlock_val;
++	int corun_threshold_events;
++
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* list of struct preempt_notifier: */
+ 	struct hlist_head preempt_notifiers;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index c2b66a277e98..9cdc313f652c 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -871,7 +871,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
+ 				      const struct iovec __user *rvec,
+ 				      unsigned long riovcnt,
+ 				      unsigned long flags);
+-
++asmlinkage long sys_bwlock(pid_t pid, int val, int cte);
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1324b0292ec2..819af5ad1f24 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -662,6 +662,9 @@ __SC_COMP(__NR_recvmmsg, sys_recvmmsg, compat_sys_recvmmsg)
+  */
+ #define __NR_arch_specific_syscall 244
+ 
++#define __NR_bwlock 245
++__SYSCALL(__NR_bwlock, sys_bwlock)
++
+ #define __NR_wait4 260
+ __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
+ #define __NR_prlimit64 261
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 732e993..2759b4d 100644
+index 732e993b564b..9b664ee45132 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -606,6 +606,34 @@ void resched_cpu(int cpu)
@@ -89,11 +144,74 @@ index 732e993..2759b4d 100644
  		}
  	}
  
+@@ -4176,6 +4202,62 @@ err_size:
+ 	return -E2BIG;
+ }
+ 
++/*
++ * nr_bwlocked_cores
++ * Calculate the number of currently bandwidth locked cores
++ */
++int nr_bwlocked_cores(void)
++{
++	unsigned long i;
++
++	/* Iterate over each online core */
++	for_each_online_cpu(i) {
++		if (cpu_rq(i)->curr->bwlock_val)
++			return cpu_rq(i)->curr->corun_threshold_events;
++	}
++
++	/* Return the number to caller */
++	return -1;
++}
++
++/* Add bandwidth lock specific declarations here */
++EXPORT_SYMBOL(nr_bwlocked_cores);
++
++/*
++ * sys_bwlock - Memory bandwidth control lock. Provides exclusive access to
++ * main memory to the holder. Holder must be a real-time task
++ *
++ * @pid	: pid of the process which wants to hold bandwidth lock
++ * @val : bwlock value 0 - unlock | 1 - lock
++ * @cte : Safe memory usage threshold for corunning tasks
++ */
++SYSCALL_DEFINE3(bwlock, pid_t, pid, int, val, int, cte)
++{
++	struct task_struct *p;
++
++	/* Obtain the task structure associated with the process
++	   referenced by pid */
++	if (pid == 0 || current->pid == pid)
++		p = current;
++	else
++		p = find_process_by_pid (pid);
++
++	/* Process does not exist or it is not a real-time process */
++	if (!p || !rt_task (p))
++		return -1;
++
++	if (val == 0) {
++		/* Release the lock and restore the old priority of the task */
++		p->bwlock_val = 0;
++	} else {
++		p->bwlock_val = 1;
++		p->corun_threshold_events = cte;
++	}
++
++	/* Return with success */
++	return 0;
++}
++
+ /**
+  * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+  * @pid: the pid in question.
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index 69631fa..4e88a0c 100644
+index 69631fa46c2f..99360545ef23 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
-@@ -69,3 +69,11 @@ SCHED_FEAT(RT_RUNTIME_SHARE, true)
+@@ -69,3 +69,10 @@ SCHED_FEAT(RT_RUNTIME_SHARE, true)
  SCHED_FEAT(LB_MIN, false)
  SCHED_FEAT(ATTACH_AGE_LOAD, true)
  
@@ -104,9 +222,8 @@ index 69631fa..4e88a0c 100644
 + * NOTE: This feature is disabled by default.
 + */
 +SCHED_FEAT(RT_GANG_LOCK, false)
-+
 diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
-index 8ec86ab..244ac4e 100644
+index 8ec86abe0ea1..244ac4e874ec 100644
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
 @@ -8,6 +8,9 @@
@@ -219,7 +336,7 @@ index 8ec86ab..244ac4e 100644
  #endif /* CONFIG_SMP */
  
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index b242775..2e49a21 100644
+index b242775bf670..6c9f801c355d 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -1168,6 +1168,7 @@ static const u32 prio_to_wmult[40] = {
@@ -238,7 +355,7 @@ index b242775..2e49a21 100644
  
  extern struct rt_bandwidth def_rt_bandwidth;
  extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
-@@ -1770,3 +1772,111 @@ static inline u64 irq_time_read(int cpu)
+@@ -1770,3 +1772,116 @@ static inline u64 irq_time_read(int cpu)
  }
  #endif /* CONFIG_64BIT */
  #endif /* CONFIG_IRQ_TIME_ACCOUNTING */
@@ -270,12 +387,17 @@ index b242775..2e49a21 100644
 +		rt_glock->gthreads [i] = NULL;				\
 +} while (0);
 +
++#undef DEBUG_RT_GANG
++#ifdef DEBUG_RT_GANG
 +#define TRACER(task, msg)						\
 +	printk (KERN_INFO "[G:] core=%d task=%-20s prio=%-3d"		\
 +			"mm=%p pid=%-6d tcpu=%d | %s\n",		\
 +			smp_processor_id (), (task)->comm,		\
 +			(task)->prio, (task)->mm, (task)->pid,		\
 +			task_cpu (task), msg);
++#else
++#define TRACER(task, msg)
++#endif
 +
 +static inline void gang_lock_cpu (struct task_struct *thread)
 +{
