@@ -1,5 +1,5 @@
 diff --git a/Makefile b/Makefile
-index 10993715abb8..60fe974c6963 100644
+index 10993715abb8..ae5e91341e28 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -1,7 +1,7 @@
@@ -7,10 +7,35 @@ index 10993715abb8..60fe974c6963 100644
  PATCHLEVEL = 4
  SUBLEVEL = 50
 -EXTRAVERSION =
-+EXTRAVERSION = -RTGv1
++EXTRAVERSION = -RTGv2
  NAME = Blurry Fish Butt
  
  # *DOCUMENTATION*
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+index ede692ffa32e..c6ac61c8b18e 100644
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -281,6 +281,7 @@
+ #define __NR_remap_file_pages		(__NR_SYSCALL_BASE+253)
+					/* 254 for set_thread_area */
+					/* 255 for get_thread_area */
++#define __NR_bwlock			(__NR_SYSCALL_BASE+255)
+ #define __NR_set_tid_address		(__NR_SYSCALL_BASE+256)
+ #define __NR_timer_create		(__NR_SYSCALL_BASE+257)
+ #define __NR_timer_settime		(__NR_SYSCALL_BASE+258)
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index ac368bb068d1..09fdb29d6710 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -264,7 +264,7 @@
+		CALL(ABI(sys_epoll_wait, sys_oabi_epoll_wait))
+		CALL(sys_remap_file_pages)
+		CALL(sys_ni_syscall)	/* sys_set_thread_area */
+-/* 255 */	CALL(sys_ni_syscall)	/* sys_get_thread_area */
++/* 255 */	CALL(sys_bwlock)	/* sys_get_thread_area */
+		CALL(sys_set_tid_address)
+		CALL(sys_timer_create)
+		CALL(sys_timer_settime)
 diff --git a/include/linux/sched.h b/include/linux/sched.h
 index ce0f61dcd887..f89c29b17d2f 100644
 --- a/include/linux/sched.h
@@ -54,7 +79,7 @@ index 1324b0292ec2..819af5ad1f24 100644
  __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
  #define __NR_prlimit64 261
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 20253dbc8610..df7c0999aeb9 100644
+index 20253dbc8610..4391aa004e63 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -606,6 +606,34 @@ void resched_cpu(int cpu)
@@ -144,7 +169,7 @@ index 20253dbc8610..df7c0999aeb9 100644
  		}
  	}
  
-@@ -4202,6 +4228,62 @@ err_size:
+@@ -4202,6 +4228,68 @@ err_size:
  	return -E2BIG;
  }
  
@@ -168,6 +193,12 @@ index 20253dbc8610..df7c0999aeb9 100644
 +
 +/* Add bandwidth lock specific declarations here */
 +EXPORT_SYMBOL(nr_bwlocked_cores);
++
++int rt_lock_status(void)
++{
++	return rt_glock->prio;
++}
++EXPORT_SYMBOL(rt_lock_status);
 +
 +/*
 + * sys_bwlock - Memory bandwidth control lock. Provides exclusive access to
