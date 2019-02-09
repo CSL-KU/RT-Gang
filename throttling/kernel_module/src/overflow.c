@@ -7,11 +7,6 @@ extern struct perfmod_info		perfmod_info;
 extern struct core_info __percpu	*core_info;
 extern int				g_period_us;
 
-/* Define throttle punishment factor. This parameter decides how much a
-   bandwidth intensive non-RT thread should be punished in the presence
-   of bandwidth locked threads */
-extern u32				sysctl_tfs_throttle_factor;
-
 /*
  * event_overflow_callback
  * This is the IRQ handler associated with PMC overflow interrupt. This function invokes
@@ -39,9 +34,6 @@ void event_overflow_callback (struct perf_event *event,
 void perfmod_process_overflow (struct irq_work* entry)
 {
 	struct core_info *cinfo = this_cpu_ptr (core_info);
-	// int bwlock_core_cnt = nr_bwlocked_cores ();
-	// int i = smp_processor_id ();;
-
 	DEBUG_OVERFLOW (trace_printk ("[STATUS] Overflow on Core-%d\n", i));
 
 	/* Stop counter */
@@ -125,9 +117,6 @@ int throttle_thread (void *arg)
 
 		/* We should have a throttle thread */
 		if (cinfo->throttled_task) {
-			/* Update the vruntime of the throttled task to keep CFS behavior normal */
-			cinfo->throttled_task->se.vruntime += (sysctl_tfs_throttle_factor * delta_time);
-
 			/* Synchronize across smp cores */
 			smp_mb ();
 

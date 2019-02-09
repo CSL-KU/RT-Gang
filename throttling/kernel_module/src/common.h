@@ -83,15 +83,14 @@ struct core_info {
 /**************************************************************************
  * External Function Prototypes
  **************************************************************************/
-extern int nr_bwlocked_cores (void);
+extern u32 sysctl_llc_maxperf_events;
+extern int be_mem_threshold;
 
 /**************************************************************************
  * Interface functions
  **************************************************************************/
 
 /* Defined in perf.c */
-u64 convert_mb_to_events (int);
-int convert_events_to_mb (u64);
 u64 perf_event_count (struct perf_event *);
 void __start_counter (void *);
 void start_counters (void);
@@ -106,9 +105,6 @@ enum hrtimer_restart periodic_timer_callback (struct hrtimer *);
 void event_overflow_callback (struct perf_event *, struct perf_sample_data *, struct pt_regs *);
 void perfmod_process_overflow (struct irq_work *);
 int throttle_thread (void *);
-
-/* Defined in control.c */
-int init_bwlock_controlfs (void);
 
 /**************************************************************************
  * Global Inline Function Definitions

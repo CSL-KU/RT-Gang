@@ -8,8 +8,6 @@ extern struct core_info __percpu	*core_info;
 /* Define initial event limits */
 extern u32				sysctl_llc_maxperf_events;
 extern u32				sysctl_llc_throttle_events;
-extern u32				sysdbg_reset_throttle_time;
-extern u64				sysdbg_total_throttle_time;
 
 /*
  * period_timer_callback
@@ -19,7 +17,7 @@ extern u64				sysdbg_total_throttle_time;
 enum hrtimer_restart periodic_timer_callback (struct hrtimer *timer)
 {
 	struct core_info *cinfo = this_cpu_ptr (core_info);
-	int corun_threshold_events, over_run_cnt, i;
+	int over_run_cnt;
 
 	/* Forward the hrtimer and get the number of overruns */
 	over_run_cnt = hrtimer_forward_now (timer, cinfo->period_in_ktime);
@@ -31,18 +29,13 @@ enum hrtimer_restart periodic_timer_callback (struct hrtimer *timer)
 	cinfo->event->pmu->stop (cinfo->event, PERF_EF_UPDATE);
 
 	/* Check if the core needs to be throttled */
-	corun_threshold_events = nr_bwlocked_cores ();
-	if (corun_threshold_events > 0 && current->bwlock_val == 0) {
-		if ((rt_task (current) && cinfo->throttle_core != 1))
-			/* Give the core maximum bandwidth since it is executing a real-time
-			   task which is not kthrottle */
-			cinfo->budget = sysctl_llc_maxperf_events;
-		else
-			/* Throttle the core */
-			cinfo->budget = corun_threshold_events;
-	} else
-		/* Give the core maximumum bandwidth */
+	if ((rt_task (current) && cinfo->throttle_core != 1))
+		/* Give the core maximum bandwidth since it is executing a real-time
+		   task which is not kthrottle */
 		cinfo->budget = sysctl_llc_maxperf_events;
+	else
+		/* Throttle the core */
+		cinfo->budget = be_mem_threshold;
 
 	cinfo->event->hw.sample_period = cinfo->budget;
 	local64_set (&cinfo->event->hw.period_left, cinfo->budget);
@@ -59,16 +52,6 @@ enum hrtimer_restart periodic_timer_callback (struct hrtimer *timer)
 		DEBUG_MONITOR (trace_printk ("[MONITOR] Task: %10s | V-Time: %10lld\n",
 					      current->comm,
 					      current->se.vruntime));
-	}
-
-	if (smp_processor_id () == 0 && sysdbg_reset_throttle_time) {
-		sysdbg_total_throttle_time = 0;
-		for_each_online_cpu (i) {
-			struct core_info *cinfo = per_cpu_ptr (core_info, i);
-			sysdbg_total_throttle_time += cinfo->core_throttle_duration;
-			cinfo->core_throttle_duration = 0;
-		}
-		sysdbg_reset_throttle_time = 0;
 	}
 
 	smp_mb ();

@@ -7,32 +7,6 @@ extern struct core_info __percpu	*core_info;
 extern int				g_period_us;
 
 /*
- * convert_mb_to_events
- * This function converts memory bandwidth into LLC-events according to the
- * following formula:
- *
- * Events (LLC Misses) = (Bandwidth (MB/s) * 1 M * Duration) / (LLC Line Size)
- */
-u64 convert_mb_to_events (int mb)
-{
-	/* Return the answer to the caller */
-	return div64_u64 ((u64)mb * 1024 * 1024, CACHE_LINE_SIZE * (1000000 / g_period_us));
-}
-
-/*
- * convert_events_to_mb
- * This function converts (and ceils) the LLC-miss events into memory bandwidth
- */
-int convert_events_to_mb (u64 events)
-{
-	int divisor = g_period_us * 1024 * 1024;
-	int mb = div64_u64 (events * CACHE_LINE_SIZE * 1000000 + (divisor - 1), divisor);
-
-	/* Return the calculated mega-bytes value to caller */
-	return mb;
-}
-
-/*
  * perf_event_count
  * This function calculates the number of performance monitoring events which have
  * been registered so far in the current period

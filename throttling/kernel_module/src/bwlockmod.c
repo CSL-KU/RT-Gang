@@ -31,20 +31,8 @@ struct core_info __percpu	*core_info;
 int				g_period_us 			= 1000;
 
 /* Define initial event limits */
-int				sysctl_maxperf_bw_mb		= 10000;
-int				sysctl_throttle_bw_mb		= 100;
-u32				sysctl_llc_maxperf_events	= 163840;	// 10000 MBps
+u32				sysctl_llc_maxperf_events	= 1638400;	// 100000 MBps
 u32				sysctl_llc_throttle_events	= 1638;		// 100 MBps
-
-/* Pointer to the BWLOCK++ directory under debugfs */
-struct dentry			*bwlockmod_dir;
-
-/* Define throttle punishment factor. This parameter decides how much a
-   bandwidth intensive non-RT thread should be punished in the presence
-   of bandwidth locked threads */
-u32				sysctl_tfs_throttle_factor	= 0;
-u32				sysdbg_reset_throttle_time 	= 0;
-u64				sysdbg_total_throttle_time 	= 0;
 
 /**************************************************************************
  * Function Definitions
@@ -55,7 +43,7 @@ u64				sysdbg_total_throttle_time 	= 0;
  */
 int init_module (void)
 {
-	int i, ret = 0;
+	int i;
 	struct perfmod_info *global = &perfmod_info;
 
 	/* Reset the perfmod data structure */
@@ -83,12 +71,6 @@ int init_module (void)
 		wake_up_process (cinfo->init_thread);
 	}
 
-	/* Initialize BWLOCK++ debugfs */
-	ret = init_bwlock_controlfs ();
-
-	if (ret)
-		trace_printk ("[ERROR] Unable to initialize debugfs components\n");
-
 	/* Initialization complete */
 	return 0;
 }
@@ -107,7 +89,7 @@ int lazy_init_thread (void *arg)
 	cinfo->core_throttle_duration = 0;
 	cinfo->core_throttle_period_cnt = 0;
 	cinfo->throttle_core = 0;
-	cinfo->budget = convert_mb_to_events (sysctl_maxperf_bw_mb);
+	cinfo->budget = sysctl_llc_maxperf_events;
 	init_waitqueue_head (&cinfo->throttle_evt);
 	init_irq_work (&cinfo->pending, perfmod_process_overflow);
 	smp_wmb ();
@@ -197,9 +179,6 @@ void cleanup_module (void)
 	/* Print cleanup message to trace buffer */
 	DEBUG_TIME(trace_printk ("[TIME] Total System Throttle Duration : %llu ms\n", div64_u64 (global->system_throttle_duration, M1)));
 	DEBUG_TIME(trace_printk ("[TIME] Total System Throttle Periods : %llu\n", global->system_throttle_period_cnt));
-
-	/* Remove debugfs directories */
-	debugfs_remove_recursive (bwlockmod_dir);
 	trace_printk ("BWLOCK kernel module has been successfully removed!\n");
 
 	/* Cleanup complete */
