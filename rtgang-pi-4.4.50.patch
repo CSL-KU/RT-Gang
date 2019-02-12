@@ -1,24 +1,11 @@
-diff --git a/Makefile b/Makefile
-index 10993715abb8..ae5e91341e28 100644
---- a/Makefile
-+++ b/Makefile
-@@ -1,7 +1,7 @@
- VERSION = 4
- PATCHLEVEL = 4
- SUBLEVEL = 50
--EXTRAVERSION =
-+EXTRAVERSION = -RTGv2
- NAME = Blurry Fish Butt
- 
- # *DOCUMENTATION*
 diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
 index ede692ffa32e..c6ac61c8b18e 100644
 --- a/arch/arm/include/uapi/asm/unistd.h
 +++ b/arch/arm/include/uapi/asm/unistd.h
 @@ -281,6 +281,7 @@
  #define __NR_remap_file_pages		(__NR_SYSCALL_BASE+253)
-					/* 254 for set_thread_area */
-					/* 255 for get_thread_area */
+ 					/* 254 for set_thread_area */
+ 					/* 255 for get_thread_area */
 +#define __NR_bwlock			(__NR_SYSCALL_BASE+255)
  #define __NR_set_tid_address		(__NR_SYSCALL_BASE+256)
  #define __NR_timer_create		(__NR_SYSCALL_BASE+257)
@@ -28,31 +15,30 @@ index ac368bb068d1..09fdb29d6710 100644
 --- a/arch/arm/kernel/calls.S
 +++ b/arch/arm/kernel/calls.S
 @@ -264,7 +264,7 @@
-		CALL(ABI(sys_epoll_wait, sys_oabi_epoll_wait))
-		CALL(sys_remap_file_pages)
-		CALL(sys_ni_syscall)	/* sys_set_thread_area */
+ 		CALL(ABI(sys_epoll_wait, sys_oabi_epoll_wait))
+ 		CALL(sys_remap_file_pages)
+ 		CALL(sys_ni_syscall)	/* sys_set_thread_area */
 -/* 255 */	CALL(sys_ni_syscall)	/* sys_get_thread_area */
 +/* 255 */	CALL(sys_bwlock)	/* sys_get_thread_area */
-		CALL(sys_set_tid_address)
-		CALL(sys_timer_create)
-		CALL(sys_timer_settime)
+ 		CALL(sys_set_tid_address)
+ 		CALL(sys_timer_create)
+ 		CALL(sys_timer_settime)
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index ce0f61dcd887..f89c29b17d2f 100644
+index ce0f61dcd887..a3f155c73714 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -1405,6 +1405,10 @@ struct task_struct {
+@@ -1405,6 +1405,9 @@ struct task_struct {
  #endif
  	struct sched_dl_entity dl;
  
-+	/* BWLOCK++ Related Fields */
-+	int bwlock_val;
++	/* Throttling Related Fields */
 +	int corun_threshold_events;
 +
  #ifdef CONFIG_PREEMPT_NOTIFIERS
  	/* list of struct preempt_notifier: */
  	struct hlist_head preempt_notifiers;
 diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
-index c2b66a277e98..9cdc313f652c 100644
+index c2b66a277e98..4268f06d789a 100644
 --- a/include/linux/syscalls.h
 +++ b/include/linux/syscalls.h
 @@ -871,7 +871,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
@@ -60,26 +46,26 @@ index c2b66a277e98..9cdc313f652c 100644
  				      unsigned long riovcnt,
  				      unsigned long flags);
 -
-+asmlinkage long sys_bwlock(pid_t pid, int val, int cte);
++asmlinkage long sys_bwlock(pid_t pid, int cte);
  asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
  			 unsigned long idx1, unsigned long idx2);
  asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
 diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
-index 1324b0292ec2..819af5ad1f24 100644
+index 1324b0292ec2..db4738aa40e8 100644
 --- a/include/uapi/asm-generic/unistd.h
 +++ b/include/uapi/asm-generic/unistd.h
 @@ -662,6 +662,9 @@ __SC_COMP(__NR_recvmmsg, sys_recvmmsg, compat_sys_recvmmsg)
   */
  #define __NR_arch_specific_syscall 244
  
-+#define __NR_bwlock 245
++#define __NR_bwlock 255
 +__SYSCALL(__NR_bwlock, sys_bwlock)
 +
  #define __NR_wait4 260
  __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
  #define __NR_prlimit64 261
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 20253dbc8610..4391aa004e63 100644
+index 20253dbc8610..3c8223ecace9 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
 @@ -606,6 +606,34 @@ void resched_cpu(int cpu)
@@ -169,46 +155,18 @@ index 20253dbc8610..4391aa004e63 100644
  		}
  	}
  
-@@ -4202,6 +4228,68 @@ err_size:
+@@ -4202,6 +4228,34 @@ err_size:
  	return -E2BIG;
  }
  
-+/*
-+ * nr_bwlocked_cores
-+ * Calculate the number of currently bandwidth locked cores
-+ */
-+int nr_bwlocked_cores(void)
-+{
-+	unsigned long i;
-+
-+	/* Iterate over each online core */
-+	for_each_online_cpu(i) {
-+		if (cpu_rq(i)->curr->bwlock_val)
-+			return cpu_rq(i)->curr->corun_threshold_events;
-+	}
-+
-+	/* Return the number to caller */
-+	return -1;
-+}
-+
-+/* Add bandwidth lock specific declarations here */
-+EXPORT_SYMBOL(nr_bwlocked_cores);
-+
-+int rt_lock_status(void)
-+{
-+	return rt_glock->prio;
-+}
-+EXPORT_SYMBOL(rt_lock_status);
-+
 +/*
 + * sys_bwlock - Memory bandwidth control lock. Provides exclusive access to
 + * main memory to the holder. Holder must be a real-time task
 + *
 + * @pid	: pid of the process which wants to hold bandwidth lock
-+ * @val : bwlock value 0 - unlock | 1 - lock
 + * @cte : Safe memory usage threshold for corunning tasks
 + */
-+SYSCALL_DEFINE3(bwlock, pid_t, pid, int, val, int, cte)
++SYSCALL_DEFINE2(bwlock, pid_t, pid, int, cte)
 +{
 +	struct task_struct *p;
 +
@@ -223,13 +181,7 @@ index 20253dbc8610..4391aa004e63 100644
 +	if (!p || !rt_task (p))
 +		return -1;
 +
-+	if (val == 0) {
-+		/* Release the lock and restore the old priority of the task */
-+		p->bwlock_val = 0;
-+	} else {
-+		p->bwlock_val = 1;
-+		p->corun_threshold_events = cte;
-+	}
++	p->corun_threshold_events = cte;
 +
 +	/* Return with success */
 +	return 0;
@@ -239,35 +191,41 @@ index 20253dbc8610..4391aa004e63 100644
   * sys_sched_setscheduler - set/change the scheduler policy and RT priority
   * @pid: the pid in question.
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index 69631fa46c2f..99360545ef23 100644
+index 69631fa46c2f..2290629b3f4c 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
-@@ -69,3 +69,10 @@ SCHED_FEAT(RT_RUNTIME_SHARE, true)
- SCHED_FEAT(LB_MIN, false)
- SCHED_FEAT(ATTACH_AGE_LOAD, true)
+@@ -6,6 +6,14 @@
+ SCHED_FEAT(GENTLE_FAIR_SLEEPERS, true)
  
-+/*
+ /*
 + * Enable real-time gang scheduling framework (RT-Gang). RT-Gang allows
 + * execution of a single (multi-threaded) real-time task (i.e., gang) at any
 + * giving time across all system cores.
 + * NOTE: This feature is disabled by default.
 + */
 +SCHED_FEAT(RT_GANG_LOCK, false)
++
++/*
+  * Place new tasks ahead so that they do not starve already running
+  * tasks
+  */
 diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
-index 8ec86abe0ea1..244ac4e874ec 100644
+index 8ec86abe0ea1..bb45581fd8f2 100644
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
-@@ -8,6 +8,9 @@
+@@ -8,6 +8,11 @@
  #include <linux/slab.h>
  #include <linux/irq_work.h>
  
 +rt_gang_lock_t	rt_gang_lock;
 +rt_gang_lock_t	*rt_glock = &rt_gang_lock;
++int be_mem_threshold = SYS_MAX_LLC_EVENTS;
++EXPORT_SYMBOL(be_mem_threshold);
 +
  int sched_rr_timeslice = RR_TIMESLICE;
  
  static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
-@@ -1443,7 +1446,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
+@@ -1443,7 +1448,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
  	return next;
  }
  
@@ -276,7 +234,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
  {
  	struct sched_rt_entity *rt_se;
  	struct task_struct *p;
-@@ -1456,7 +1459,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+@@ -1456,7 +1461,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
  	} while (rt_rq);
  
  	p = rt_task_of(rt_se);
@@ -284,7 +242,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
  
  	return p;
  }
-@@ -1491,19 +1493,68 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+@@ -1491,19 +1495,70 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
  	 * We may dequeue prev's rt_rq in put_prev_task().
  	 * So, we update time before rt_nr_running check.
  	 */
@@ -323,6 +281,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
 +			rt_glock->prio = p->prio;
 +			gang_lock_cpu (p);
 +			rt_glock->lock_held = true;
++			update_mem_threshold (p);
 +		} else {
 +			BUG_ON (cpumask_weight (rt_glock->locked_cores) == 0);
 +			if (rt_glock->prio > p->prio) {
@@ -331,6 +290,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
 +				do_gang_preemption ();
 +				rt_glock->prio = p->prio;
 +				gang_lock_cpu (p);
++				update_mem_threshold (p);
 +			} else if (p->prio == rt_glock->prio) {
 +				/* 'p' is part of the current RT gang */
 +				gang_lock_cpu (p);
@@ -357,7 +317,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
  	queue_push_tasks(rq);
  
  	return p;
-@@ -2115,6 +2166,8 @@ void __init init_sched_rt_class(void)
+@@ -2115,6 +2170,8 @@ void __init init_sched_rt_class(void)
  		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
  					GFP_KERNEL, cpu_to_node(i));
  	}
@@ -367,7 +327,7 @@ index 8ec86abe0ea1..244ac4e874ec 100644
  #endif /* CONFIG_SMP */
  
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index 0517abd7dd73..3b16702dc144 100644
+index 0517abd7dd73..0602ccb63333 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
 @@ -1168,6 +1168,7 @@ static const u32 prio_to_wmult[40] = {
@@ -386,7 +346,7 @@ index 0517abd7dd73..3b16702dc144 100644
  
  extern struct rt_bandwidth def_rt_bandwidth;
  extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
-@@ -1783,3 +1785,116 @@ static inline void account_reset_rq(struct rq *rq)
+@@ -1783,3 +1785,144 @@ static inline void account_reset_rq(struct rq *rq)
  	rq->prev_steal_time_rq = 0;
  #endif
  }
@@ -403,6 +363,7 @@ index 0517abd7dd73..3b16702dc144 100644
 +	struct task_struct*	gthreads [NR_CPUS];
 +} rt_gang_lock_t;
 +
++extern int be_mem_threshold;
 +extern rt_gang_lock_t	*rt_glock;
 +
 +#define RT_SYS_PRIO_THRESHOLD		(50)
@@ -418,8 +379,24 @@ index 0517abd7dd73..3b16702dc144 100644
 +		rt_glock->gthreads [i] = NULL;				\
 +} while (0);
 +
-+#undef DEBUG_RT_GANG
-+#ifdef DEBUG_RT_GANG
++/*
++ * Default memory usage threshold for best-effort tasks. On a system with
++ * 64-Byte cache line size, this equals 100 GBytes/sec i.e., no throttling.
++ */
++#define	SYS_MAX_LLC_EVENTS		(1638400)
++
++/*
++ * The following budget (for using main memory) is applied by default to all
++ * best-effort tasks on a per-core basis while a real-time task is executing.
++ * On a system with 64-Byte cache line size, the value specified below comes
++ * out to be 100 MBytes/sec.
++ * The goal here is to throttle 'aggressively' by default so that the
++ * best-effort tasks are not able to interfere with the real-time tasks.
++ */
++#define	SYS_DEFAULT_LLC_EVENTS		(1638)
++
++#undef RT_GANG_DEBUG
++#ifdef RT_GANG_DEBUG
 +#define TRACER(task, msg)						\
 +	printk (KERN_INFO "[G:] core=%d task=%-20s prio=%-3d"		\
 +			"mm=%p pid=%-6d tcpu=%d | %s\n",		\
@@ -497,9 +474,20 @@ index 0517abd7dd73..3b16702dc144 100644
 +		TRACER (thread, "Lock free");
 +		rt_glock->prio = INT_MAX;
 +		rt_glock->lock_held = false;
++		be_mem_threshold = SYS_MAX_LLC_EVENTS;
 +		resched_cpus (rt_glock->blocked_cores);
 +		cpumask_clear (rt_glock->blocked_cores);
 +	}
++
++	return;
++}
++
++static inline void update_mem_threshold (struct task_struct *thread)
++{
++	if (thread->corun_threshold_events)
++		be_mem_threshold = thread->corun_threshold_events;
++	else
++		be_mem_threshold = SYS_DEFAULT_LLC_EVENTS;
 +
 +	return;
 +}

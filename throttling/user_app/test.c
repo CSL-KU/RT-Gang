@@ -7,7 +7,7 @@
 #include <sys/syscall.h>
 #include <time.h>
 
-#define SYS_bwlock 245
+#define SYS_bwlock 255
 
 int main(int argc, char *argv [])
 {
