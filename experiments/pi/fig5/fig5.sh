@@ -22,10 +22,8 @@ echo 'Co-Sched Experiment'
 echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched_features
 sleep 2
 
-tau_be_mem -t 0 -c 2 -n 1 -m 1024 -i 1000000000 --jobs 100000 --period 0 &>    \
-/tmp/tau_be_mem.mint &
-tau_be_cpu -t 0 -c 3 -n 1 -m 8 -i 1000000000 --jobs 100000 --period 0 &>       \
-/tmp/tau_be_cpu.mint &
+tau_be_mem -t 0 -c 2 -n 1 -m 1024 &> /tmp/tau_be_mem.mint &
+tau_be_cpu -t 0 -c 3 -n 1 -m 8 &> /tmp/tau_be_cpu.mint &
 
 chrt -f 5 tau_2 -t 0 -c 2 -n 2 -m 384 -i 85 --jobs 500 --period 30 -v 1 &>     \
 /tmp/tau_2.mint &
@@ -46,10 +44,8 @@ echo RT_GANG_LOCK > /sys/kernel/debug/sched_features
 insmod ../../../throttling/kernel_module/exe/bwlockmod.ko
 sleep 2
 
-tau_be_mem -t 0 -c 2 -n 1 -m 1024 -i 1000000000 --jobs 100000 --period 1000 &> \
-/tmp/tau_be_mem.rtg &
-tau_be_cpu -t 0 -c 3 -n 1 -m 8 -i 1000000000 --jobs 100000 --period 1000 &>    \
-/tmp/tau_be_cpu.rtg &
+tau_be_mem -t 0 -c 2 -n 1 -m 1024 &> /tmp/tau_be_mem.rtg &
+tau_be_cpu -t 0 -c 3 -n 1 -m 8 &> /tmp/tau_be_cpu.rtg &
 
 chrt -f 5 tau_2 -t 0 -c 2 -n 2 -m 384 -i 85 --jobs 500 --period 30 -v 1 &>     \
 /tmp/tau_2.rtg &

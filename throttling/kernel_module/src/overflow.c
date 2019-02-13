@@ -106,6 +106,9 @@ int throttle_thread (void *arg)
 		smp_mb ();
 
 		while (cinfo->throttle_core && !kthread_should_stop ()) {
+			if (be_mem_threshold >= sysctl_llc_maxperf_events) {
+				cinfo->throttle_core = 0;
+			}
 			cpu_relax ();
 			smp_mb ();
 		}
