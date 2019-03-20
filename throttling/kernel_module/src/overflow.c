@@ -114,7 +114,7 @@ int throttle_thread (void *arg)
 		}
 
 		/* Mark the end of throttle time */
-		delta_time = (u64) (ktime_get ().tv64 - cinfo->core_throttle_start_mark.tv64);
+		delta_time = (u64) (TM_NS (ktime_get ()) - TM_NS (cinfo->core_throttle_start_mark));
 		cinfo->core_throttle_duration += delta_time;
 		cinfo->core_throttle_period_cnt++;
 

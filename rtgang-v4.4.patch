@@ -1,8 +1,33 @@
+diff --git a/arch/arm/include/uapi/asm/unistd.h b/arch/arm/include/uapi/asm/unistd.h
+index ede692ffa32e..c6ac61c8b18e 100644
+--- a/arch/arm/include/uapi/asm/unistd.h
++++ b/arch/arm/include/uapi/asm/unistd.h
+@@ -281,6 +281,7 @@
+ #define __NR_remap_file_pages		(__NR_SYSCALL_BASE+253)
+ 					/* 254 for set_thread_area */
+ 					/* 255 for get_thread_area */
++#define __NR_bwlock			(__NR_SYSCALL_BASE+255)
+ #define __NR_set_tid_address		(__NR_SYSCALL_BASE+256)
+ #define __NR_timer_create		(__NR_SYSCALL_BASE+257)
+ #define __NR_timer_settime		(__NR_SYSCALL_BASE+258)
+diff --git a/arch/arm/kernel/calls.S b/arch/arm/kernel/calls.S
+index ac368bb068d1..09fdb29d6710 100644
+--- a/arch/arm/kernel/calls.S
++++ b/arch/arm/kernel/calls.S
+@@ -264,7 +264,7 @@
+ 		CALL(ABI(sys_epoll_wait, sys_oabi_epoll_wait))
+ 		CALL(sys_remap_file_pages)
+ 		CALL(sys_ni_syscall)	/* sys_set_thread_area */
+-/* 255 */	CALL(sys_ni_syscall)	/* sys_get_thread_area */
++/* 255 */	CALL(sys_bwlock)	/* sys_get_thread_area */
+ 		CALL(sys_set_tid_address)
+ 		CALL(sys_timer_create)
+ 		CALL(sys_timer_settime)
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 4d05a8d..bfef2a4 100644
+index ce0f61dcd887..a3f155c73714 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -1416,6 +1416,9 @@ struct task_struct {
+@@ -1405,6 +1405,9 @@ struct task_struct {
  #endif
  	struct sched_dl_entity dl;
  
@@ -13,7 +38,7 @@ index 4d05a8d..bfef2a4 100644
  	/* list of struct preempt_notifier: */
  	struct hlist_head preempt_notifiers;
 diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
-index c2b66a2..4268f06 100644
+index c2b66a277e98..4268f06d789a 100644
 --- a/include/linux/syscalls.h
 +++ b/include/linux/syscalls.h
 @@ -871,7 +871,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
@@ -26,24 +51,24 @@ index c2b66a2..4268f06 100644
  			 unsigned long idx1, unsigned long idx2);
  asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
 diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
-index 1324b02..819af5a 100644
+index 1324b0292ec2..db4738aa40e8 100644
 --- a/include/uapi/asm-generic/unistd.h
 +++ b/include/uapi/asm-generic/unistd.h
 @@ -662,6 +662,9 @@ __SC_COMP(__NR_recvmmsg, sys_recvmmsg, compat_sys_recvmmsg)
   */
  #define __NR_arch_specific_syscall 244
  
-+#define __NR_bwlock 245
++#define __NR_bwlock 255
 +__SYSCALL(__NR_bwlock, sys_bwlock)
 +
  #define __NR_wait4 260
  __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
  #define __NR_prlimit64 261
 diff --git a/kernel/sched/core.c b/kernel/sched/core.c
-index 8d2cd2b..f2d7d8f 100644
+index 20253dbc8610..3c8223ecace9 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -607,6 +607,34 @@ void resched_cpu(int cpu)
+@@ -606,6 +606,34 @@ void resched_cpu(int cpu)
  	raw_spin_unlock_irqrestore(&rq->lock, flags);
  }
  
@@ -78,7 +103,7 @@ index 8d2cd2b..f2d7d8f 100644
  #ifdef CONFIG_SMP
  #ifdef CONFIG_NO_HZ_COMMON
  /*
-@@ -3065,33 +3093,31 @@ static inline void schedule_debug(struct task_struct *prev)
+@@ -3054,33 +3082,31 @@ static inline void schedule_debug(struct task_struct *prev)
  static inline struct task_struct *
  pick_next_task(struct rq *rq, struct task_struct *prev)
  {
@@ -130,7 +155,7 @@ index 8d2cd2b..f2d7d8f 100644
  		}
  	}
  
-@@ -4213,6 +4239,34 @@ err_size:
+@@ -4202,6 +4228,34 @@ err_size:
  	return -E2BIG;
  }
  
@@ -166,7 +191,7 @@ index 8d2cd2b..f2d7d8f 100644
   * sys_sched_setscheduler - set/change the scheduler policy and RT priority
   * @pid: the pid in question.
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index b91da5f..e13d305 100644
+index 69631fa46c2f..2290629b3f4c 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
 @@ -6,6 +6,14 @@
@@ -185,7 +210,7 @@ index b91da5f..e13d305 100644
   * tasks
   */
 diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
-index 6a839a4..bddd935 100644
+index 8ec86abe0ea1..bb45581fd8f2 100644
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
 @@ -8,6 +8,11 @@
@@ -200,7 +225,7 @@ index 6a839a4..bddd935 100644
  int sched_rr_timeslice = RR_TIMESLICE;
  
  static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
-@@ -1480,7 +1485,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
+@@ -1443,7 +1448,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
  	return next;
  }
  
@@ -209,7 +234,7 @@ index 6a839a4..bddd935 100644
  {
  	struct sched_rt_entity *rt_se;
  	struct task_struct *p;
-@@ -1493,7 +1498,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+@@ -1456,7 +1461,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
  	} while (rt_rq);
  
  	p = rt_task_of(rt_se);
@@ -217,7 +242,7 @@ index 6a839a4..bddd935 100644
  
  	return p;
  }
-@@ -1528,19 +1532,70 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+@@ -1491,19 +1495,70 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
  	 * We may dequeue prev's rt_rq in put_prev_task().
  	 * So, we update time before rt_nr_running check.
  	 */
@@ -292,7 +317,7 @@ index 6a839a4..bddd935 100644
  	queue_push_tasks(rq);
  
  	return p;
-@@ -2152,6 +2207,8 @@ void __init init_sched_rt_class(void)
+@@ -2115,6 +2170,8 @@ void __init init_sched_rt_class(void)
  		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
  					GFP_KERNEL, cpu_to_node(i));
  	}
@@ -302,10 +327,10 @@ index 6a839a4..bddd935 100644
  #endif /* CONFIG_SMP */
  
 diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
-index b654396..eae5f6a 100644
+index 0517abd7dd73..0602ccb63333 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -1179,6 +1179,7 @@ static const u32 prio_to_wmult[40] = {
+@@ -1168,6 +1168,7 @@ static const u32 prio_to_wmult[40] = {
  #define DEQUEUE_SAVE		0x02
  
  #define RETRY_TASK		((void *)-1UL)
@@ -313,7 +338,7 @@ index b654396..eae5f6a 100644
  
  struct sched_class {
  	const struct sched_class *next;
-@@ -1312,6 +1313,7 @@ extern void init_sched_fair_class(void);
+@@ -1298,6 +1299,7 @@ extern void init_sched_fair_class(void);
  
  extern void resched_curr(struct rq *rq);
  extern void resched_cpu(int cpu);
@@ -321,7 +346,7 @@ index b654396..eae5f6a 100644
  
  extern struct rt_bandwidth def_rt_bandwidth;
  extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
-@@ -1857,3 +1859,129 @@ static inline void account_reset_rq(struct rq *rq)
+@@ -1783,3 +1785,144 @@ static inline void account_reset_rq(struct rq *rq)
  	rq->prev_steal_time_rq = 0;
  #endif
  }
@@ -354,17 +379,32 @@ index b654396..eae5f6a 100644
 +		rt_glock->gthreads [i] = NULL;				\
 +} while (0);
 +
-+#define	SYS_MAX_LLC_EVENTS		(1638400)	/* 100 GB/sec */
-+#define	SYS_DEFAULT_LLC_EVENTS		(1638)		/* 100 MB/sec */
-+#define TRACER(task, msg)
++/*
++ * Default memory usage threshold for best-effort tasks. On a system with
++ * 64-Byte cache line size, this equals 100 GBytes/sec i.e., no throttling.
++ */
++#define	SYS_MAX_LLC_EVENTS		(1638400)
 +
-+#if 0
++/*
++ * The following budget (for using main memory) is applied by default to all
++ * best-effort tasks on a per-core basis while a real-time task is executing.
++ * On a system with 64-Byte cache line size, the value specified below comes
++ * out to be 100 MBytes/sec.
++ * The goal here is to throttle 'aggressively' by default so that the
++ * best-effort tasks are not able to interfere with the real-time tasks.
++ */
++#define	SYS_DEFAULT_LLC_EVENTS		(1638)
++
++#undef RT_GANG_DEBUG
++#ifdef RT_GANG_DEBUG
 +#define TRACER(task, msg)						\
 +	printk (KERN_INFO "[G:] core=%d task=%-20s prio=%-3d"		\
 +			"mm=%p pid=%-6d tcpu=%d | %s\n",		\
 +			smp_processor_id (), (task)->comm,		\
 +			(task)->prio, (task)->mm, (task)->pid,		\
 +			task_cpu (task), msg);
++#else
++#define TRACER(task, msg)
 +#endif
 +
 +static inline void gang_lock_cpu (struct task_struct *thread)

@@ -29,6 +29,10 @@
 #include <linux/signal.h>
 #include <linux/sched/rt.h>
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 13, 0)
+#include <linux/sched/types.h>
+#endif
+
 /**************************************************************************
  * Public Definitions
  **************************************************************************/
@@ -45,6 +49,12 @@
 #define K1			1000ULL
 #define M1			(K1 * K1)
 #define G1			(K1 * K1 * K1)
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 10, 0)
+#define TM_NS(x)		(x)
+#else
+#define TM_NS(x)		(x).tv64
+#endif
 
 /**************************************************************************
  * Public Types
