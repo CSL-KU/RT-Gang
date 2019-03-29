@@ -1,0 +1,1529 @@
+diff --git a/Makefile b/Makefile
+index 44445f2..5f343ab 100644
+--- a/Makefile
++++ b/Makefile
+@@ -1,7 +1,7 @@
+ VERSION = 4
+ PATCHLEVEL = 4
+ SUBLEVEL = 38
+-EXTRAVERSION =
++EXTRAVERSION = -RTGv2
+ NAME = Blurry Fish Butt
+ 
+ # *DOCUMENTATION*
+diff --git a/init/Kconfig b/init/Kconfig
+index b4c3fc7..42a9eb0 100644
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1244,6 +1244,23 @@ config SCHED_AUTOGROUP
+ 	  desktop applications.  Task group autogeneration is currently based
+ 	  upon task session.
+ 
++config SCHED_RTGANG
++	bool "Include RT_GANG_LOCK in scheduling features"
++	help
++	  This option introduces the RT-Gang scheduling feature. Under RT-Gang,
++	  only one (parallel) real-time task is allowed to execute on all
++	  system cores at any given time. This resolves the problem of shared
++	  resource contention among different real-time tasks and guarantees
++	  complete performance isolation to the highest priority real-time
++	  task.
++
++config SCHED_THROTTLE
++	bool "Enable best-effor task throttling support inside scheduler"
++	help
++	  This option integrates a kernel level task throttling framework into
++	  the scheduler. This framework can be used to limit the interference
++	  from best-effort tasks to real-time tasks.
++
+ config SYSFS_DEPRECATED
+ 	bool "Enable deprecated sysfs features to support old userspace tools"
+ 	depends on SYSFS
+diff --git a/kernel/sched/Makefile b/kernel/sched/Makefile
+index 43fb319..8db3155 100644
+--- a/kernel/sched/Makefile
++++ b/kernel/sched/Makefile
+@@ -23,3 +23,5 @@ obj-$(CONFIG_SCHED_DEBUG) += debug.o
+ obj-$(CONFIG_CGROUP_CPUACCT) += cpuacct.o
+ obj-$(CONFIG_CPU_FREQ) += cpufreq.o
+ obj-$(CONFIG_CPU_FREQ_GOV_SCHEDUTIL) += cpufreq_schedutil.o
++obj-$(CONFIG_SCHED_RTGANG) += rtgang.o
++obj-$(CONFIG_SCHED_THROTTLE) += throttle.o
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 8d2cd2b..f2d7d8f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -607,6 +607,34 @@ void resched_cpu(int cpu)
+ 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+ }
+ 
++/*
++ * The purpose of this function is to force rescheduling of a target cpu under
++ * all circumstances. For this reason, this function does not acquire the
++ * target CPU's rq lock and sends a rescheduling interrupt without protection
++ * if need be. It is used exclusively in RT-Gang related code.
++ */
++void resched_cpu_force (int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++	struct task_struct *curr = rq->curr;
++
++	if (test_tsk_need_resched(curr))
++		return;
++
++	cpu = cpu_of(rq);
++
++	if (cpu == smp_processor_id()) {
++		set_tsk_need_resched(curr);
++		set_preempt_need_resched();
++		return;
++	}
++
++	if (set_nr_and_not_polling(curr))
++		smp_send_reschedule(cpu);
++	else
++		trace_sched_wake_idle_without_ipi(cpu);
++}
++
+ #ifdef CONFIG_SMP
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+@@ -3065,33 +3093,31 @@ static inline void schedule_debug(struct task_struct *prev)
+ static inline struct task_struct *
+ pick_next_task(struct rq *rq, struct task_struct *prev)
+ {
+-	const struct sched_class *class = &fair_sched_class;
++	const struct sched_class *class;
+ 	struct task_struct *p;
+-
+-	/*
+-	 * Optimization: we know that if all tasks are in
+-	 * the fair class we can call that function directly:
+-	 */
+-	if (likely(prev->sched_class == class &&
+-		   rq->nr_running == rq->cfs.h_nr_running)) {
+-		p = fair_sched_class.pick_next_task(rq, prev);
+-		if (unlikely(p == RETRY_TASK))
+-			goto again;
+-
+-		/* assumes fair_sched_class->next == idle_sched_class */
+-		if (unlikely(!p))
+-			p = idle_sched_class.pick_next_task(rq, prev);
+-
+-		return p;
+-	}
++	bool skip_retry_flag = false;
+ 
+ again:
+ 	for_each_class(class) {
+ 		p = class->pick_next_task(rq, prev);
+ 		if (p) {
+-			if (unlikely(p == RETRY_TASK))
++			if (p == BLOCK_TASK) {
++				/*
++				 * Do not honor the RETRY request from the fair
++				 * class since blocking of task in RT class is
++				 * being done on purpose.
++				 */
++				skip_retry_flag = true;
++				continue;
++			}
++
++			if (p != RETRY_TASK)
++				/* We have a valid task. Return it! */
++				return p;
++
++			if (!skip_retry_flag && p == RETRY_TASK)
++				/* Restart the task picking loop */
+ 				goto again;
+-			return p;
+ 		}
+ 	}
+ 
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index b27f783..6e64991 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -15,6 +15,7 @@
+  *                    Fabio Checconi <fchecconi@gmail.com>
+  */
+ #include "sched.h"
++#include "rtgang.h"
+ 
+ #include <linux/slab.h>
+ 
+@@ -1161,6 +1162,7 @@ struct task_struct *pick_next_task_dl(struct rq *rq, struct task_struct *prev)
+ 	struct sched_dl_entity *dl_se;
+ 	struct task_struct *p;
+ 	struct dl_rq *dl_rq;
++	int ret;
+ 
+ 	dl_rq = &rq->dl;
+ 
+@@ -1187,22 +1189,37 @@ struct task_struct *pick_next_task_dl(struct rq *rq, struct task_struct *prev)
+ 	 * When prev is DL, we may throttle it in put_prev_task().
+ 	 * So, we update time before we check for dl_nr_running.
+ 	 */
+-	if (prev->sched_class == &dl_sched_class)
++	if (prev->sched_class == &dl_sched_class) {
+ 		update_curr_dl(rq);
+ 
++#ifdef CONFIG_SCHED_RTGANG
++		if (sched_feat(RT_GANG_LOCK))
++			rtg_try_release_lock(prev);
++#endif
++	}
++
+ 	if (unlikely(!dl_rq->dl_nr_running))
+ 		return NULL;
+ 
+-	put_prev_task(rq, prev);
+-
+ 	dl_se = pick_next_dl_entity(rq, dl_rq);
+ 	BUG_ON(!dl_se);
+ 
+ 	p = dl_task_of(dl_se);
++
++#ifdef CONFIG_SCHED_RTGANG
++	if (sched_feat(RT_GANG_LOCK)) {
++		ret = rtg_try_acquire_lock(p);
++
++		if (ret == RTG_BLOCK)
++			return BLOCK_TASK;
++	}
++#endif
++
++	put_prev_task(rq, prev);
+ 	p->se.exec_start = rq_clock_task(rq);
+ 
+ 	/* Running task will never be pushed. */
+-       dequeue_pushable_dl_task(rq, p);
++	dequeue_pushable_dl_task(rq, p);
+ 
+ 	if (hrtick_enabled(rq))
+ 		start_hrtick_dl(rq, p);
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index b91da5f..0234011 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -5,6 +5,16 @@
+  */
+ SCHED_FEAT(GENTLE_FAIR_SLEEPERS, true)
+ 
++#ifdef CONFIG_SCHED_RTGANG
++/*
++ * Enable real-time gang scheduling framework (RT-Gang). RT-Gang allows
++ * execution of a single (multi-threaded) real-time task (i.e., gang) at any
++ * giving time across all system cores.
++ * NOTE: This feature is disabled by default.
++ */
++SCHED_FEAT(RT_GANG_LOCK, false)
++#endif
++
+ /*
+  * Place new tasks ahead so that they do not starve already running
+  * tasks
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 6a839a4..9f8077f 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include "sched.h"
++#include "rtgang.h"
+ 
+ #include <linux/slab.h>
+ #include <linux/irq_work.h>
+@@ -1480,7 +1481,7 @@ static struct sched_rt_entity *pick_next_rt_entity(struct rq *rq,
+ 	return next;
+ }
+ 
+-static struct task_struct *_pick_next_task_rt(struct rq *rq)
++static struct task_struct *__peek_next_task_rt(struct rq *rq)
+ {
+ 	struct sched_rt_entity *rt_se;
+ 	struct task_struct *p;
+@@ -1493,7 +1494,6 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+ 	} while (rt_rq);
+ 
+ 	p = rt_task_of(rt_se);
+-	p->se.exec_start = rq_clock_task(rq);
+ 
+ 	return p;
+ }
+@@ -1501,6 +1501,7 @@ static struct task_struct *_pick_next_task_rt(struct rq *rq)
+ static struct task_struct *
+ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ {
++	int ret;
+ 	struct task_struct *p;
+ 	struct rt_rq *rt_rq = &rq->rt;
+ 
+@@ -1528,19 +1529,34 @@ pick_next_task_rt(struct rq *rq, struct task_struct *prev)
+ 	 * We may dequeue prev's rt_rq in put_prev_task().
+ 	 * So, we update time before rt_nr_running check.
+ 	 */
+-	if (prev->sched_class == &rt_sched_class)
++	if (prev->sched_class == &rt_sched_class) {
+ 		update_curr_rt(rq);
+ 
++#ifdef CONFIG_SCHED_RTGANG
++		if (sched_feat(RT_GANG_LOCK))
++			rtg_try_release_lock(prev);
++#endif
++	}
++
+ 	if (!rt_rq->rt_queued)
+ 		return NULL;
+ 
+-	put_prev_task(rq, prev);
++	p = __peek_next_task_rt (rq);
+ 
+-	p = _pick_next_task_rt(rq);
++#ifdef CONFIG_SCHED_RTGANG
++	if (sched_feat(RT_GANG_LOCK) && RTG_FIFO_CHECK(p)) {
++		ret = rtg_try_acquire_lock(p);
++
++		if (ret == RTG_BLOCK)
++			return BLOCK_TASK;
++	}
++#endif
++
++	put_prev_task (rq, prev);
++	p->se.exec_start = rq_clock_task (rq);
+ 
+ 	/* The running task is never eligible for pushing */
+ 	dequeue_pushable_task(rq, p);
+-
+ 	queue_push_tasks(rq);
+ 
+ 	return p;
+diff --git a/kernel/sched/rtgang.c b/kernel/sched/rtgang.c
+new file mode 100644
+index 0000000..7dfa20a
+--- /dev/null
++++ b/kernel/sched/rtgang.c
+@@ -0,0 +1,253 @@
++/*
++ * kernel/sched/rtgang.c
++ *
++ * Real-Time Gang Scheduling Framework
++ *
++ * Copyright (C) 2019 CSL-KU
++ * 2019-03-28	Separation of RT-Gang from scheduler core
++ * 2019-03-29	Support EDF tasks (SCHED_DEADLINE)
++ * 2019-03-29	Conditionally compile RT-Gang into kernel
++ */
++#include "sched.h"
++#include "rtgang.h"
++#include <linux/debugfs.h>
++
++/*
++ * Global variables
++ */
++struct rtgang_lock rtgang_lock;
++struct rtgang_lock *rtg_lock = &rtgang_lock;
++
++/*
++ * Current debug level
++ * Default: 0 (No debug messages)
++ */
++int rtg_debug_level = 0;
++
++/*
++ * gang_lock_cpu - Acquire RT-Gang lock on behalf of the thread
++ */
++static inline void gang_lock_cpu(struct task_struct *thread)
++{
++	int cpu = smp_processor_id();
++
++	cpumask_set_cpu(cpu, rtg_lock->locked_cores);
++	rtg_lock->gthreads [cpu] = thread;
++	rtg_debug(2, "    rtg_lock_thread: comm=%s sched=%s pid=%d\n",
++			thread->comm, PRINT_SCHED(thread), thread->pid);
++
++	return;
++}
++
++/*
++ * resched_cpus - Send rescheduling interrupt(s) to CPUs in mask
++ */
++static inline void resched_cpus(cpumask_var_t mask)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++
++	for_each_cpu (cpu, mask) {
++		rtg_debug(3, "        rtg_resched_cpu: cpu=%d\n", cpu);
++
++		if (cpu == this_cpu)
++			continue;
++
++		resched_cpu_force(cpu);
++	}
++
++	return;
++}
++
++/*
++ * do_gang_preemption - Preempt currently running executing gang on behalf of
++ * 'next' gang
++ *
++ * Acquire RT-Gang lock on behalf of 'next' gang
++ */
++static inline void do_gang_preemption(struct task_struct *next)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++
++	for_each_cpu (cpu, rtg_lock->locked_cores) {
++		WARN_ON(rtg_lock->gthreads [cpu] == NULL);
++
++		if (cpu != this_cpu)
++			resched_cpu_force(cpu);
++
++		rtg_debug(2, "    rtg_preempt_thread: cpu=%d comm=%s sched=%s "
++				"pid=%d\n", cpu,
++				rtg_lock->gthreads [cpu]->comm,
++				PRINT_SCHED(rtg_lock->gthreads [cpu]),
++				rtg_lock->gthreads [cpu]->pid);
++		rtg_lock->gthreads [cpu] = NULL;
++	}
++
++	cpumask_clear(rtg_lock->locked_cores);
++	gang_lock_cpu(next);
++	rtg_lock->leader = next;
++
++	return;
++}
++
++/*
++ * try_glock_release - Release RT-Gang lock on behalf of 'thread'
++ *
++ * Send rescheduling interrupt to blocked CPUs if RT-Gang lock is now free.
++ */
++static inline void try_glock_release(struct task_struct *thread)
++{
++	int cpu;
++
++	WARN_ON(cpumask_weight(rtg_lock->locked_cores) == 0);
++
++	/*
++	 * Release RT-Gang lock of 'prev' task on all cores it may have ran on.
++	 * Migrated tasks can hold lock on multiple cores.
++	 */
++	for_each_cpu (cpu, rtg_lock->locked_cores) {
++		if (rtg_lock->gthreads [cpu] == thread) {
++			WARN_ON(!rt_prio(thread->prio));
++			cpumask_clear_cpu(cpu, rtg_lock->locked_cores);
++			rtg_debug(2, "    rtg_unlock_thread: cpu=%d comm=%s "
++				"sched=%s pid=%d\n", cpu, thread->comm,
++				PRINT_SCHED(thread), thread->pid);
++		}
++	}
++
++	if (cpumask_weight(rtg_lock->locked_cores) == 0) {
++		/* RT-Gang lock is now free. Reschedule blocked cores */
++		rtg_lock->leader = NULL;
++		rtg_lock->busy = false;
++		resched_cpus(rtg_lock->blocked_cores);
++		cpumask_clear(rtg_lock->blocked_cores);
++		rtg_debug(1, "rtg_release\n");
++	}
++
++	return;
++}
++
++/*
++ * rtg_try_release_lock - Interface function for releasing RT-Gang lock
++ *
++ * If the task going out of execution on this CPU is holding RT-Gang lock,
++ * release it on the task's behalf and perform necessary book keeping.
++ */
++void rtg_try_release_lock(struct task_struct *prev)
++{
++	/*
++	 * If 'prev' is a member of the current RT gang, update the
++	 * locked_cores mask and release the RT gang lock if necessary.
++	 */
++	raw_spin_lock(&rtg_lock->access_lock);
++	if (rtg_lock->busy)
++		try_glock_release(prev);
++	raw_spin_unlock(&rtg_lock->access_lock);
++
++	return;
++}
++
++/*
++ * rtg_try_acquire_lock - Interface function for obtaining RT-Gang lock
++ *
++ * Check if the next task is eligibile to obtain RT-Gang lock. If not, block
++ * the task from executing on this CPU.
++ */
++int rtg_try_acquire_lock(struct task_struct *next)
++{
++	int this_cpu = smp_processor_id();
++	int ret = RTG_CONTINUE;
++
++	raw_spin_lock(&rtg_lock->access_lock);
++	if (!rtg_lock->busy) {
++		/* No RT gang exist currently; begin a new gang */
++		BUG_ON(cpumask_weight(rtg_lock->locked_cores) != 0);
++		BUG_ON(cpumask_weight(rtg_lock->blocked_cores) != 0);
++
++		rtg_debug(1, "rtg_acquire\n");
++		gang_lock_cpu(next);
++		rtg_lock->busy = true;
++		rtg_lock->leader = next;
++		goto out;
++	}
++
++	BUG_ON(cpumask_weight(rtg_lock->locked_cores) == 0);
++	if (rtg_lock->leader->tgid == next->tgid) {
++		/* 'p' is part of the current RT gang */
++		rtg_debug(1, "rtg_add\n");
++		gang_lock_cpu(next);
++		goto out;
++	}
++
++	/*
++	 * Gang preemption conditions:
++	 *   1. Current gang leader and 'next' task are of same scheduler type
++	 *   	1.1. EDF: 'next' has earlier deadline
++	 *   	1.2. FIFO: 'next' has higher priority
++	 *   2. Current gang leader and 'next' task are of different scheduler
++	 *   type and next is an EDF task
++	 */
++	if (((IS_SAME_CLASS(next, rtg_lock->leader)) &&
++		((IS_EDF(next) && IS_EARLIER_EDF(next, rtg_lock->leader)) ||
++		(!IS_EDF(next) && IS_HIGHER_PRIO(next, rtg_lock->leader)))) ||
++	   ((!IS_SAME_CLASS(next, rtg_lock->leader)) && IS_EDF(next))) {
++		rtg_debug(1, "rtg_preempt: prev=%s sched=%s prio=%llu | "
++			"next=%s " "sched=%s prio=%llu\n",
++			rtg_lock->leader->comm, PRINT_SCHED(rtg_lock->leader),
++			PRINT_PRIO(rtg_lock->leader), next->comm,
++			PRINT_SCHED(next), PRINT_PRIO(next));
++
++		do_gang_preemption(next);
++	} else {
++		/* 'p' has lower priority; blocked */
++		if (!cpumask_test_cpu(this_cpu, rtg_lock->blocked_cores)) {
++			cpumask_set_cpu(this_cpu, rtg_lock->blocked_cores);
++			rtg_debug(1, "rtg_block: comm=%s sched=%s pid=%d "
++				"prio=%llu\n", next->comm, PRINT_SCHED(next),
++				next->pid, PRINT_PRIO(next));
++		}
++
++		ret = RTG_BLOCK;
++	}
++
++out:
++	raw_spin_unlock(&rtg_lock->access_lock);
++	return ret;
++}
++
++/*
++ * rtg_init_lock - Initialize RT-Gang data-structure and interface
++ *
++ * Called at the end of kernel initialization. Performs bare-minimum setup for
++ * using RT-Gang at runtime.
++ */
++static int __init rtg_init_lock(void)
++{
++	int i = 0;
++	struct dentry *dir;
++	umode_t mode = S_IFREG | S_IRUSR | S_IWUSR;
++
++	dir = debugfs_create_dir("rtgang", NULL);
++	if (!dir)
++		return PTR_ERR(dir);
++
++	if (!debugfs_create_u32("debug_level", mode, dir, &rtg_debug_level))
++		goto fail;
++
++	raw_spin_lock_init(&rtg_lock->access_lock);
++	rtg_lock->busy = false;
++	zalloc_cpumask_var(&rtg_lock->locked_cores, GFP_KERNEL);
++	zalloc_cpumask_var(&rtg_lock->blocked_cores, GFP_KERNEL);
++	rtg_lock->leader = NULL;
++
++	for (; i < NR_CPUS; i++)
++		rtg_lock->gthreads [i] = NULL;
++
++	return 0;
++fail:
++	debugfs_remove_recursive(dir);
++	return -ENOMEM;
++}
++
++late_initcall(rtg_init_lock);
+diff --git a/kernel/sched/rtgang.h b/kernel/sched/rtgang.h
+new file mode 100644
+index 0000000..971053b
+--- /dev/null
++++ b/kernel/sched/rtgang.h
+@@ -0,0 +1,45 @@
++#ifdef CONFIG_SCHED_RTGANG
++
++#define	RTG_CONTINUE			0
++#define RTG_BLOCK			1
++
++#define	SYS_MAX_LLC_EVENTS		(163840)	/* 100 GB/sec	*/
++#define	SYS_DEFAULT_LLC_EVENTS		(1638)		/* 1 GB/sec	*/
++
++#define RTG_FIFO_PRIO_THRESHOLD		(50)
++
++#define RTG_FIFO_CHECK(p)					\
++	(p->mm && p->prio > RTG_FIFO_PRIO_THRESHOLD)
++
++#define IS_SAME_CLASS(p, n)	(p->sched_class == n->sched_class)
++#define IS_EDF(p)		(p->sched_class == &dl_sched_class)
++#define IS_EARLIER_EDF(p, n)	(dl_time_before(p->dl.deadline, n->dl.deadline))
++#define IS_HIGHER_PRIO(p, n)	(p->prio < n->prio)
++
++#define PRINT_SCHED(p)		(IS_EDF(p)? "EDF":"FIFO")
++#define PRINT_PRIO(p)		(IS_EDF(p)? p->dl.deadline:(u64)p->prio)
++
++struct rtgang_lock {
++	bool			busy;
++	raw_spinlock_t		access_lock;
++	struct task_struct*	leader;
++	struct task_struct*	gthreads [NR_CPUS];
++	cpumask_var_t		locked_cores;
++	cpumask_var_t		blocked_cores;
++};
++
++#define RTG_DEBUG
++#ifdef RTG_DEBUG
++#define rtg_debug(level, format, ...)				\
++do {								\
++	if (rtg_debug_level >= level)				\
++		trace_printk(format, ##__VA_ARGS__);		\
++} while (0);
++#else
++#define rtg_debug(level, format, ...)
++#endif
++
++void rtg_try_release_lock(struct task_struct *prev);
++int rtg_try_acquire_lock(struct task_struct *next);
++
++#endif /* CONFIG_SCHED_RTGANG */
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index b654396..5a5b2f7 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -1179,6 +1179,7 @@ static const u32 prio_to_wmult[40] = {
+ #define DEQUEUE_SAVE		0x02
+ 
+ #define RETRY_TASK		((void *)-1UL)
++#define BLOCK_TASK		((void *)-2UL)
+ 
+ struct sched_class {
+ 	const struct sched_class *next;
+@@ -1312,6 +1313,7 @@ extern void init_sched_fair_class(void);
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
++extern void resched_cpu_force(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+diff --git a/kernel/sched/throttle.c b/kernel/sched/throttle.c
+new file mode 100644
+index 0000000..12f0c51
+--- /dev/null
++++ b/kernel/sched/throttle.c
+@@ -0,0 +1,794 @@
++/*
++ * kernel/sched/throttle.c
++ *
++ * Best-Effort Task Throttling Framework
++ *
++ * Copyright (C) 2019 CSL-KU
++ * 2019-03-23	Integration of BWLOCK++ throttling framework into the scheduler
++ * 2019-03-24	Enable runtime selection of throttling event
++ * 2019-03-25	Enable runtime selection of throttling event
++ * 2019-03-26	Support up-to 2 throttling events simultaneously
++ * 2019-03-27	Support variable number of throttling events
++ * 2019-03-27	Code refactoring and cleanup
++ */
++#include <linux/perf_event.h>
++#include <linux/debugfs.h>
++#include <linux/uaccess.h>
++#include <linux/kthread.h>
++#include "throttle.h"
++#include "sched.h"
++
++/*
++ * Globals: Define various global variables
++ */
++struct th_core_info __percpu	*th_core_info;
++
++/*
++ * Flag for enabling throttling during runtime
++ * default: false
++ */
++static bool			th_enable = false;
++
++/*
++ * Throttle fair scheduler punishment factor
++ * default: 0 (No TFS)
++ */
++static int			th_tfs_factor = 0;
++
++/*
++ * Current debug level
++ * default: 0 (No debug messages)
++ */
++static int			th_debug_level = 0;
++
++/*
++ * Period of throttling tick in us
++ * default: 1ms
++ */
++static int			th_period_us = 1000;
++
++/*
++ * th_start_hr_tick - Start HR-Timer tick on "THIS" CPU
++ */
++static void th_start_hr_tick(void)
++{
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	hrtimer_start(&cinfo->hrtimer, cinfo->period_in_ktime,
++			HRTIMER_MODE_REL_PINNED);
++	th_debug(1, "th_hr_tick_start\n");
++
++	return;
++}
++
++/*
++ * th_stop_hr_tick - Stop HR-Timer tick on "THIS" CPU
++ */
++static void th_stop_hr_tick(void)
++{
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	hrtimer_cancel(&cinfo->hrtimer);
++	th_debug(1, "th_hr_tick_stop\n");
++
++	return;
++}
++
++/*
++ * th_start_counter - Start a specific perf counter on "THIS" CPU
++ */
++static void th_start_counter(struct th_event_info *ev_info)
++{
++	perf_event_enable(ev_info->event);
++	ev_info->event->pmu->add(ev_info->event, PERF_EF_START);
++	th_debug(1, "th_counter_start: event_id=0x%x\n", ev_info->hw_register);
++
++	return;
++}
++
++/*
++ * th_stop_counter - Stop a specific perf counter on "THIS" CPU
++ */
++static void th_stop_counter(struct th_event_info *ev_info)
++{
++	ev_info->event->pmu->stop(ev_info->event, PERF_EF_UPDATE);
++	ev_info->event->pmu->del(ev_info->event, 0);
++	th_debug(1, "th_counter_stop: event_id=0x%x\n", ev_info->hw_register);
++
++	return;
++}
++
++/*
++ * th_event_count - Return current count of a regulated perf event
++ */
++static inline u64 th_event_count(struct perf_event *event)
++{
++	return local64_read(&event->count) +
++		atomic64_read(&event->child_count);
++}
++
++/*
++ * th_init_counter - Create perf kernel counter for a regulated event
++ *
++ * The counter is created inactive and must later be started explicitly.
++ */
++static struct perf_event* th_init_counter(struct th_event_info* ev_info)
++{
++	int cpu = smp_processor_id();
++	struct perf_event *event = NULL;
++	struct perf_event_attr sched_perf_hw_attr = {
++		.type		= PERF_TYPE_RAW,
++		.config		= ev_info->hw_register,
++		.size		= sizeof (struct perf_event_attr),
++		.pinned		= 1,
++		.disabled	= 1,
++		.exclude_kernel	= 1,
++		.sample_period	= ev_info->budget,
++	};
++
++	event = perf_event_create_kernel_counter(&sched_perf_hw_attr, cpu,
++					NULL, th_event_overflow_helper, NULL);
++
++	return event;
++}
++
++/*
++ * th_init_per_cpu - Initialize throttling framework on "THIS" CPU
++ *
++ * Create throttling event and initialize throttle thread. Create LLC
++ * performance counter and HRTICK handler. This is meant to be invoked only
++ * once.
++ */
++static void th_init_per_cpu(void)
++{
++	int i = smp_processor_id();
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	/* Create throttling event for this core. Associate with irq handler */
++	cinfo->throttle_core = false;
++	init_waitqueue_head(&cinfo->throttle_evt);
++	init_irq_work(&cinfo->pending, th_event_overflow_callback);
++
++	/* Initialize throttle thread */
++	cinfo->throttle_thread = kthread_create_on_node(th_throttle_thread,
++			NULL, cpu_to_node(i), "kthrottle/%d", i);
++	kthread_bind(cinfo->throttle_thread, i);
++	wake_up_process(cinfo->throttle_thread);
++
++	/* Setup HR-Timer interrupt */
++	cinfo->period_in_ktime = ktime_set(0, th_period_us * K1);
++	hrtimer_init(&cinfo->hrtimer, CLOCK_MONOTONIC,
++			HRTIMER_MODE_REL_PINNED);
++	(&cinfo->hrtimer)->function = &th_timer_callback;
++
++	/* Initialize events list */
++	INIT_LIST_HEAD(&cinfo->events);
++	th_debug(1, "th_init_pass\n");
++
++	return;
++}
++
++/*
++ * th_enable_framework_per_cpu - Start throttling framework on "THIS" CPU
++ *
++ * Start the HR-timer and enable performance counters for all regulated events.
++ * Can be invoked as needed during runtime.
++ */
++static int th_enable_framework_per_cpu(void)
++{
++	struct th_event_info *curr;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	if (!cinfo->th_initialized) {
++		/* Perform one time initialization */
++		th_init_per_cpu();
++		cinfo->th_initialized = true;
++	}
++
++	if (!cinfo->th_regulated_events) {
++		/*
++		 * No point in starting timer interrupts when there are no
++		 * events to regulate.
++		 */
++		th_debug(1, "th_idle_no_events\n");
++		return 0;
++	}
++
++	list_for_each_entry(curr, &cinfo->events, list)
++		th_start_counter(curr);
++
++	th_start_hr_tick();
++	cinfo->th_running = true;
++
++	return 0;
++}
++
++/*
++ * th_disable_framework_per_cpu - Stop the throttling framework on "THIS" CPU
++ *
++ * Stop the HR-timer and disable all currently active performance counters. Can
++ * be invoked as needed during runtime.
++ */
++static int th_disable_framework_per_cpu(void)
++{
++	struct th_event_info *curr;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	list_for_each_entry(curr, &cinfo->events, list)
++		th_stop_counter(curr);
++
++	th_stop_hr_tick();
++	cinfo->th_running = false;
++
++	return 0;
++}
++
++/*
++ * th_timer_callback - HR-Timer tick handler
++ *
++ * Replenish all the performance counters of this CPU and stop the throttle
++ * thread if it is active.
++ */
++enum hrtimer_restart th_timer_callback(struct hrtimer *timer)
++{
++	u64 budget;
++	u64 current_event_count;
++	struct perf_event *event;
++	struct th_event_info *curr;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++	int over_run_cnt = hrtimer_forward_now(timer, cinfo->period_in_ktime);
++
++	if (over_run_cnt == 0)
++		/* Timer has not expired yet */
++		return HRTIMER_RESTART;
++
++	cinfo->stats.ticks_till_now += over_run_cnt;
++	if (!cinfo->th_regulated_events) {
++		/*
++		 * No need to run the timer when there are no events to
++		 * regulate.
++		 */
++		th_debug(0, "th_fatal_no_events\n");
++		return HRTIMER_NORESTART;
++	}
++
++	list_for_each_entry(curr, &cinfo->events, list) {
++		event = curr->event;
++		event->pmu->stop(event, PERF_EF_UPDATE);
++		current_event_count = th_event_count(event);
++		th_debug(4, "th_hr_tick: event_id=0x%x event_count=%llu\n",
++				curr->hw_register, (current_event_count -
++				curr->count_till_now));
++		curr->count_till_now = current_event_count;
++
++		/*
++		 * If the current task on this core is an RT-task; other than
++		 * the kthrottle thread, it will not be throttled.
++		 */
++		if ((rt_task(current) && cinfo->throttle_core != 1))
++			budget = TH_MAX_COUNT;
++		else
++			budget = curr->budget;
++
++		event->hw.sample_period = budget;
++		local64_set(&event->hw.period_left, budget);
++		event->pmu->start(event, PERF_EF_RELOAD);
++	}
++
++	/* This will stop kthrottle */
++	cinfo->throttle_core = false;
++
++	return HRTIMER_RESTART;
++}
++
++/*
++ * th_event_overflow_helper - Perf event overflow handler
++ *
++ * Invoked in NMI context. Schedule IRQ work for handling overflow on this CPU.
++ */
++void th_event_overflow_helper(struct perf_event *event,
++		struct perf_sample_data *data, struct pt_regs *regs)
++{
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	irq_work_queue(&cinfo->pending);
++
++	return;
++}
++
++/*
++ * th_event_overflow_callback - IRQ work handler for overflow interrupt
++ *
++ * Stop the perf events from retriggering the interrupt in this period. Wake
++ * up throttle thread on this CPU to stop offending task.
++ */
++void th_event_overflow_callback(struct irq_work* entry)
++{
++	struct perf_event *event;
++	struct th_event_info *curr;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	list_for_each_entry(curr, &cinfo->events, list) {
++		event = curr->event;
++		event->pmu->stop(event, PERF_EF_UPDATE);
++		local64_set((&event->hw.period_left), TH_MAX_COUNT);
++		event->pmu->start (event, PERF_EF_RELOAD);
++	}
++
++	if (!rt_task(current)) {
++		th_debug(2, "th_event_overflow: comm=%s\n", current->comm);
++		cinfo->throttle_core = true;
++		cinfo->throttled_task = current;
++		wake_up_interruptible(&cinfo->throttle_evt);
++	}
++
++	return;
++}
++
++/*
++ * th_throttle_thread - High priority kernel thread for idling this CPU
++ *
++ * Loop on the flag "throttle_core" in this CPU's info structure. Stop further
++ * perf events from happening on this CPU in the current period.
++ */
++int th_throttle_thread(void *params)
++{
++	u64 delta_time;
++	ktime_t ts_throttle_start;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++	static const struct sched_param param = {
++		.sched_priority = MAX_USER_RT_PRIO / 2,
++	};
++
++	sched_setscheduler(current, SCHED_FIFO, &param);
++	th_debug(1, "th_kthrottle_create\n");
++
++	while (!kthread_should_stop()) {
++		wait_event_interruptible(cinfo->throttle_evt,
++				cinfo->throttle_core || kthread_should_stop());
++
++		th_debug(3, "th_kthread_wakeup\n");
++		if (kthread_should_stop())
++			break;
++
++		ts_throttle_start = ktime_get();
++		while (cinfo->throttle_core && !kthread_should_stop())
++			cpu_relax();
++
++		th_debug(3, "th_kthread_sleep\n");
++		delta_time = (u64)(ktime_get().tv64 - ts_throttle_start.tv64);
++		cinfo->stats.throttle_duration += delta_time;
++		cinfo->stats.throttle_periods++;
++
++		if (cinfo->throttled_task) {
++			/*
++			 * Scale the vruntime of offending task as per the
++			 * throttling penalty. This is determined by the TFS
++			 * punishment factor.
++			 */
++			cinfo->throttled_task->se.vruntime += (th_tfs_factor *
++					delta_time);
++			cinfo->throttled_task = NULL;
++		} else
++			th_debug(0, "th_fatal_no_task\n");
++	}
++
++	return 0;
++}
++
++/* th_regulate_event_per_cpu - Create new regulation event on "THIS" CPU
++ *
++ * Allocate and populate the event node. Create counter for the event and
++ * return event information to the caller for tracking.
++ */
++static struct th_event_info* th_regulate_event_per_cpu(struct th_work_info
++						*info)
++{
++	struct th_event_info *ev_info;
++
++	ev_info = kmalloc(sizeof(struct th_event_info), GFP_KERNEL);
++
++	if (!ev_info) {
++		th_debug(0, "th_event_kmalloc_fail: event_id=0x%x\n",
++				info->event_id);
++		return NULL;
++	}
++
++	ev_info->hw_register = info->event_id;
++	ev_info->budget = info->budget;
++	ev_info->event = th_init_counter(ev_info);
++
++	if (!ev_info->event) {
++		th_debug(0, "th_event_create_fail: event_id=0x%x\n",
++			info->event_id);
++
++		kfree(ev_info);
++		return NULL;
++	}
++
++	INIT_LIST_HEAD(&ev_info->list);
++	th_debug(1, "th_event_create_pass: event_id=0x%x\n", info->event_id);
++
++	return ev_info;
++}
++
++/*
++ * th_release_event_per_cpu - Destroy an existing event on "THIS" CPU
++ *
++ * Release the counter associated with the event and de-allocate its storage.
++ */
++static void th_release_event_per_cpu(int event_id)
++{
++	int ret;
++	struct th_event_info *curr, *temp;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	/* Find the event to be released */
++	list_for_each_entry_safe(curr, temp, &cinfo->events, list) {
++		if (curr->hw_register != cinfo->work_info.event_id)
++			continue;
++
++		th_stop_counter(curr);
++		ret = perf_event_release_kernel(curr->event);
++
++		if (!!ret) {
++			th_debug(0, "th_event_release_fail: event_id=0x%x\n",
++					curr->hw_register);
++			break;
++		}
++
++		list_del(&curr->list);
++		kfree(curr);
++
++		th_debug(1, "th_event_release_pass: event_id=0x%x\n",
++				curr->hw_register);
++		cinfo->th_regulated_events--;
++		break;
++	}
++
++	return;
++}
++
++/*
++ * th_worker_thread - Per core kernel thread for performing core-specific tasks
++ *
++ * The work to be performed by this thread is determined by the "work_info"
++ * field inside the info structure of this core at the time of invocation.
++ */
++int th_worker_thread(void *params)
++{
++	struct th_event_info *ev_info;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	while (!kthread_should_stop()) {
++		th_debug(3, "th_wthread_wakeup\n");
++
++		switch (cinfo->work_info.type) {
++			case ENABLE:
++				th_enable_framework_per_cpu();
++				break;
++
++			case DISABLE:
++				th_disable_framework_per_cpu();
++				break;
++
++			case REGULATE:
++				/*
++				 * Initialize a new event counter for
++				 * regulating that event.
++				 */
++				if (cinfo->th_running)
++					/*
++					 * Stop the throttling framework while
++					 * the new event is being created.
++					 */
++					th_disable_framework_per_cpu();
++
++				ev_info = th_regulate_event_per_cpu(
++						&cinfo->work_info);
++
++				if (ev_info) {
++					list_add(&ev_info->list,
++							&cinfo->events);
++					cinfo->th_regulated_events++;
++				}
++
++				if (th_enable)
++					/* Re-enable the framework */
++					th_enable_framework_per_cpu();
++
++				break;
++
++			case RELEASE:
++				if (cinfo->th_running)
++					/*
++					 * Stop the throttling framework while
++					 * the an event is being released.
++					 */
++					th_disable_framework_per_cpu();
++
++				th_release_event_per_cpu(
++						cinfo->work_info.event_id);
++
++				/*
++				 * Re-enable the framework if there still are
++				 * events to be regulated.
++				 */
++				if (th_enable && !!cinfo->th_regulated_events)
++					th_enable_framework_per_cpu();
++
++				break;
++
++			default:
++				th_debug(0, "th_fatal_unknown_work\n");
++				break;
++		}
++
++		/* Sleep till the next invocation */
++		cinfo->work_info.do_work = false;
++		wait_event_interruptible(cinfo->work_evt,
++				cinfo->work_info.do_work);
++	}
++
++	return 0;
++}
++
++/*
++ * th_enable_framework - Schedule work for the worker thread to enable
++ * framework on each (online) CPU
++ */
++static void th_enable_framework(void)
++{
++	int i;
++	struct th_core_info *cinfo;
++
++	for_each_online_cpu (i) {
++		cinfo = per_cpu_ptr(th_core_info, i);
++		cinfo->work_info.type = ENABLE;
++		cinfo->work_info.do_work = true;
++
++		if (!cinfo->th_initialized) {
++			/*
++			 * Initialize worker thread on this core for the first
++			 * time.
++			 */
++			init_waitqueue_head(&cinfo->work_evt);
++			cinfo->worker_thread =
++				kthread_create_on_node(th_worker_thread, NULL,
++					cpu_to_node(i), "kth_worker/%d", i);
++			kthread_bind(cinfo->worker_thread, i);
++			wake_up_process(cinfo->worker_thread);
++		} else
++			wake_up_interruptible(&cinfo->work_evt);
++	}
++
++	return;
++
++}
++
++/*
++ * th_disable_framework - Schedule work for the worker thread to disable
++ * framework on each online CPU
++ */
++static void th_disable_framework(void)
++{
++	int i;
++	struct th_core_info *cinfo;
++
++	for_each_online_cpu (i) {
++		cinfo = per_cpu_ptr(th_core_info, i);
++
++		if (!cinfo->th_initialized) {
++			th_debug(1, "th_framework_no_init\n");
++			break;
++		}
++
++		cinfo->work_info.type = DISABLE;
++		cinfo->work_info.do_work = true;
++		wake_up_interruptible(&cinfo->work_evt);
++	}
++
++	return;
++}
++
++/*
++ * th_regulate_event - Schedule work for the worker thread to regulate a new
++ * event on each online CPU
++ */
++static void th_regulate_event(int event_id, u64 budget)
++{
++	int i;
++	struct th_core_info *cinfo;
++
++	for_each_online_cpu (i) {
++		cinfo = per_cpu_ptr(th_core_info, i);
++
++		if (!cinfo->th_initialized) {
++			th_debug(1, "th_framework_idle\n");
++			break;
++		}
++
++		if (cinfo->th_regulated_events >= TH_MAX_EVENTS) {
++			th_debug(0, "th_fatal_max_events\n");
++			break;
++		}
++
++		cinfo->work_info.type = REGULATE;
++		cinfo->work_info.do_work = true;
++		cinfo->work_info.event_id = event_id;
++		cinfo->work_info.budget = budget;
++		wake_up_interruptible(&cinfo->work_evt);
++	}
++
++	return;
++}
++
++/*
++ * th_regulate_event - Schedule work for the worker thread to release an
++ * existing event on each online CPU
++ */
++static void th_release_event(int event_id)
++{
++	int i;
++	struct th_core_info *cinfo;
++
++	cinfo = this_cpu_ptr(th_core_info);
++	if (!cinfo->th_regulated_events) {
++		th_debug(0, "th_fatal_no_events\n");
++		return;
++	}
++
++	for_each_online_cpu (i) {
++		cinfo = per_cpu_ptr(th_core_info, i);
++		cinfo->work_info.type = RELEASE;
++		cinfo->work_info.do_work = true;
++		cinfo->work_info.event_id = event_id;
++		wake_up_interruptible(&cinfo->work_evt);
++	}
++
++	return;
++}
++
++/*
++ * th_write - Interface function to read user-input to the debugfs file of
++ * throttling framework
++ *
++ * Check user-prompts against recognized commands. Schedule work for kernel
++ * threads on each core based on the command.
++ */
++static ssize_t th_write(struct file *filp, const char __user *ubuf, size_t cnt,
++		loff_t *ppos)
++{
++	char buf[64];
++	int enable = 0;
++	int event_id;
++	u64 budget;
++	int new_tfs_factor = 0;
++	int new_debug_level = 0;
++
++	if (cnt > 63)
++		cnt = 63;
++
++	if (copy_from_user(&buf, ubuf, cnt))
++		return -EFAULT;
++
++	if (!strncmp(buf, "enable", 6)) {
++		sscanf(buf + 7, "%d", &enable);
++
++		if (th_enable == !!enable)
++			return cnt;
++
++		if (!!enable) {
++			th_debug(1, "th_framework_enable\n");
++			th_enable_framework();
++			th_enable = true;
++		} else {
++			th_debug(1, "th_framework_disable\n");
++			th_disable_framework();
++			th_enable = false;
++		}
++	} else if (!strncmp(buf, "regulate", 8)) {
++		sscanf(buf + 9, "0x%x %llu", &event_id, &budget);
++		th_regulate_event(event_id, budget);
++		th_debug(1, "th_regulate_event: event_id=0x%x budget=%llu\n",
++				event_id, budget);
++	} else if (!strncmp(buf, "release", 7)) {
++		sscanf(buf + 8, "0x%x", &event_id);
++		th_release_event(event_id);
++		th_debug(1, "th_release_event: event_id=0x%x\n", event_id);
++	} else if (!strncmp(buf, "debug", 5)) {
++		sscanf(buf + 6, "%d", &new_debug_level);
++		th_debug(1, "th_debug_update: old=%d new=%d\n",
++				th_debug_level, new_debug_level);
++		th_debug_level = new_debug_level;
++	} else if (!strncmp(buf, "tfs", 3)) {
++		sscanf(buf + 4, "%d", &new_tfs_factor);
++		th_debug(1, "th_tfs_update: old=%d new=%d\n",
++				th_tfs_factor, new_tfs_factor);
++		th_tfs_factor = new_tfs_factor;
++	}
++
++	*ppos += cnt;
++
++	return cnt;
++}
++
++/*
++ * th_show - Show current configuration of throttling framework
++ */
++static int th_show(struct seq_file *m, void *v)
++{
++	int i = 0;
++	struct th_event_info *curr;
++	struct th_core_info *cinfo = this_cpu_ptr(th_core_info);
++
++	seq_printf(m, "==================== Throttle Control Interface\n");
++	seq_printf(m, "%-20s: %s\n", "Framework Enabled",
++			(th_enable)? "yes" : "no");
++	seq_printf(m, "%-20s: %d\n", "Debug Level", th_debug_level);
++	seq_printf(m, "%-20s: %d\n", "TFS Factor", th_tfs_factor);
++	seq_printf(m, "\n");
++
++	seq_printf(m, "==================== Regulated Events\n");
++	seq_printf(m, TH_EVT_TABLE_HDR, "Event", "ID", "Budget");
++	seq_printf(m, "---------------------------------\n");
++
++	if (!!cinfo->th_regulated_events) {
++		list_for_each_entry(curr, &cinfo->events, list) {
++			seq_printf(m, TH_EVT_TABLE_FMT, i, curr->hw_register,
++					curr->budget);
++			i++;
++		}
++	}
++
++	seq_printf(m, "\n");
++
++	return 0;
++}
++
++static int th_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, th_show, NULL);
++}
++
++static const struct file_operations th_fops = {
++	.open		= th_open,
++	.write		= th_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++/*
++ * th_init_framework - Initialize the bare minimum data-structures and
++ * interface of throttling framework
++ */
++static int __init th_init_framework(void)
++{
++	int i;
++	struct dentry *dir;
++	struct th_core_info *cinfo;
++	umode_t mode = S_IFREG | S_IRUSR | S_IWUSR;
++
++	th_core_info = alloc_percpu(struct th_core_info);
++	smp_mb();
++
++	for_each_online_cpu (i) {
++		cinfo = per_cpu_ptr(th_core_info, i);
++		memset(cinfo, 0, sizeof(struct th_core_info));
++	}
++
++	dir = debugfs_create_dir("throttle", NULL);
++	if (!dir)
++		return PTR_ERR(dir);
++
++	if (!debugfs_create_file("control", mode, dir, NULL, &th_fops))
++		goto fail;
++
++	return 0;
++fail:
++	debugfs_remove_recursive(dir);
++	return -ENOMEM;
++}
++
++late_initcall(th_init_framework);
+diff --git a/kernel/sched/throttle.h b/kernel/sched/throttle.h
+new file mode 100644
+index 0000000..32e8814
+--- /dev/null
++++ b/kernel/sched/throttle.h
+@@ -0,0 +1,92 @@
++#ifdef CONFIG_SCHED_THROTTLE
++
++#define K1			1000ULL
++#define M1			(K1 * K1)
++#define G1			(K1 * K1 * K1)
++
++#define	TH_MAX_EVENTS		2
++#define	TH_MAX_COUNT		(0xffffffffULL)
++#define TH_EVT_TABLE_HDR	"%-10s | %-10s | %-10s\n"
++#define TH_EVT_TABLE_FMT	"%-10d | 0x%-8x | %-10llu\n"
++
++#define th_debug(level, format, ...)				\
++do {								\
++	if (th_debug_level >= level)				\
++		trace_printk(format, ##__VA_ARGS__);		\
++} while (0);
++
++typedef enum {
++	ENABLE,
++	DISABLE,
++	REGULATE,
++	RELEASE,
++} th_work_type_t;
++
++struct th_work_info {
++	th_work_type_t		type;
++	bool			do_work;
++	int			event_id;
++	u64			budget;
++};
++
++struct th_event_info {
++	u64			budget;
++	struct perf_event	*event;
++	int			hw_register;
++	u64			count_till_now;
++	struct list_head	list;
++};
++
++struct th_core_stats {
++	u64			ticks_till_now;
++	u64			throttle_duration;
++	int			throttle_periods;
++};
++
++struct th_core_info {
++	struct th_core_stats	stats;
++
++	/* HRTIMER relted fields */
++	struct hrtimer		hrtimer;
++	ktime_t			period_in_ktime;
++
++	/* Throttling related fields */
++	bool			th_initialized;
++	bool			th_running;
++	int			th_regulated_events;
++	struct list_head	events;
++
++	struct irq_work		pending;
++	wait_queue_head_t	throttle_evt;
++	bool			throttle_core;
++	struct task_struct	*throttle_thread;
++	struct task_struct	*throttled_task;
++
++	wait_queue_head_t	work_evt;
++	struct th_work_info	work_info;
++	struct task_struct	*worker_thread;
++};
++
++static void th_start_hr_tick(void);
++static void th_stop_hr_tick(void);
++static void th_start_counter(struct th_event_info *ev_info);
++static void th_stop_counter(struct th_event_info *ev_info);
++static struct perf_event* th_init_counter(struct th_event_info* ev_info);
++static void th_init_per_cpu(void);
++static int th_enable_framework_per_cpu(void);
++static int th_disable_framework_per_cpu(void);
++enum hrtimer_restart th_timer_callback(struct hrtimer *timer);
++void th_event_overflow_helper(struct perf_event *event,
++		struct perf_sample_data *data, struct pt_regs *regs);
++void th_event_overflow_callback(struct irq_work* entry);
++int th_throttle_thread(void *params);
++static struct th_event_info* th_regulate_event_per_cpu(struct th_work_info
++		*info);
++static void th_release_event_per_cpu(int event_id);
++int th_worker_thread(void *params);
++static void th_enable_framework(void);
++static void th_disable_framework(void);
++static void th_regulate_event(int event_id, u64 budget);
++static void th_release_event(int event_id);
++
++#endif /* CONFIG_SCHED_THROTTLE */
