@@ -1,0 +1,18 @@
+# started on Tue Apr 16 10:19:59 2019
+
+
+ Performance counter stats for 'tau_be_cpu -c 5 -t 1000 -m 16':
+
+       9881.386624      task-clock (msec)         #    0.380 CPUs utilized          
+             2,186      context-switches          #    0.221 K/sec                  
+                 0      cpu-migrations            #    0.000 K/sec                  
+                69      page-faults               #    0.007 K/sec                  
+    19,991,045,974      cycles                    #    2.023 GHz                    
+   <not supported>      stalled-cycles-frontend  
+   <not supported>      stalled-cycles-backend   
+    37,379,293,508      instructions              #    1.87  insns per cycle        
+   <not supported>      branches                 
+        35,982,489      branch-misses             #    0.00% of all branches        
+
+      25.982219836 seconds time elapsed
+
