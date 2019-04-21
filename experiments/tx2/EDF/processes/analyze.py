@@ -158,7 +158,7 @@ def main ():
     # directly; instead of separatly analyzing data without tracing on in 'logs'
     for scenario in data.keys():
         for task in data [scenario]['rt'].keys ():
-            fileName = 'logs2/%s.%s.trace' % (task, scenario)
+            fileName = '%s.%s.trace' % (task, scenario)
 
             if not os.path.isfile (fileName):
                 raise IOError, 'File does not exist: <%s>' % (fileName)
@@ -175,6 +175,7 @@ def main ():
 
     # plot_stats (data)
     plot_cdf (data, 'tau_1')
+    plot_cdf (data, 'tau_2')
 
     return
 

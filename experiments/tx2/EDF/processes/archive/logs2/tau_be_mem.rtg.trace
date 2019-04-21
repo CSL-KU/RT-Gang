@@ -1,0 +1,18 @@
+# started on Tue Apr 16 10:21:33 2019
+
+
+ Performance counter stats for 'tau_be_mem -c 4 -t 1000 -m 16384 -a write':
+
+       9473.428832      task-clock (msec)         #    0.472 CPUs utilized          
+             7,476      context-switches          #    0.789 K/sec                  
+                 0      cpu-migrations            #    0.000 K/sec                  
+             4,165      page-faults               #    0.440 K/sec                  
+    19,142,634,186      cycles                    #    2.021 GHz                    
+   <not supported>      stalled-cycles-frontend  
+   <not supported>      stalled-cycles-backend   
+     4,669,519,210      instructions              #    0.24  insns per cycle        
+   <not supported>      branches                 
+           760,308      branch-misses             #    0.00% of all branches        
+
+      20.067597427 seconds time elapsed
+
