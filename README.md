@@ -79,3 +79,14 @@ cd throttling/user_app
 ```
 
 6. BWLOCK will now ensure that all best-effort tasks are throttled @ 100 MB/s while the *rt-work* process is in execution.
+
+# Citation
+The paper for RT-Gang can be found [here](https://arxiv.org/pdf/1903.00999.pdf). Please use the following BibTex to cite it:
+```
+@inproceedings{wali2019rtgang,
+	title = {RT-Gang: Real-Time Gang Scheduling Framework for Safety-Critical Systems},    
+	author = {Waqar Ali and Heechul Yun},
+	booktitle = {IEEE Intl. Conference on Real-Time and Embedded Technology and Applications Symposium (RTAS)},
+	year = {2019}
+}
+```
