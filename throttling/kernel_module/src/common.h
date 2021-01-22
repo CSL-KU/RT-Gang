@@ -29,9 +29,18 @@
 #include <linux/signal.h>
 #include <linux/sched/rt.h>
 
-#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 13, 0)
-#include <linux/sched/types.h>
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
+#  include <uapi/linux/sched/types.h>
 #endif
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(4, 13, 0)
+#  include <linux/sched/types.h>
+#endif
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(3, 8, 0)
+#  include <linux/sched/rt.h>
+#endif
+
 
 /**************************************************************************
  * Public Definitions
