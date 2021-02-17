@@ -78,6 +78,9 @@ int throttle_thread (void *arg)
 	struct core_info *cinfo = per_cpu_ptr (core_info, cpunr);
 	u64 delta_time;
 
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 9, 0)
+	sched_set_fifo(current);
+#else
 	/* Declare this as a high priority task in the system */
 	static const struct sched_param param = {
 		.sched_priority = MAX_USER_RT_PRIO / 2,
@@ -85,6 +88,7 @@ int throttle_thread (void *arg)
 
 	/* Set this thread with real-time priority */
 	sched_setscheduler (current, SCHED_FIFO, &param);
+#endif
 
 	while (!kthread_should_stop () && cpu_online (cpunr)) {
 		/* Wait for something to happen */
