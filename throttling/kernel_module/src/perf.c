@@ -5,6 +5,7 @@
  **************************************************************************/
 extern struct core_info __percpu	*core_info;
 extern int				g_period_us;
+extern int                              g_hw_counter_id;
 
 /*
  * perf_event_count
@@ -34,7 +35,7 @@ struct perf_event* init_counter (int cpu,
 	/* Describe the attributes of the PMC event to be counted */
 	struct perf_event_attr sched_perf_hw_attr = {
 		.type		= PERF_TYPE_RAW,
-		.config		= 0x17,
+		.config		= g_hw_counter_id,
 		.size		= sizeof (struct perf_event_attr),
 		.pinned		= 1,
 		.disabled	= 1,
@@ -55,36 +56,6 @@ struct perf_event* init_counter (int cpu,
 }
 
 /*
- * __start_counter
- * This function starts the PM-event counter on a particular core
- */
-void __start_counter (void *info)
-{
-	struct core_info *cinfo = this_cpu_ptr (core_info);
-	trace_printk ("Perf counter started on core-%2d\n", (int) smp_processor_id ());
-
-	/* Kick off the PMC event counting */
-	perf_event_enable (cinfo->event);
-	cinfo->event->pmu->add (cinfo->event, PERF_EF_START);
-
-	/* Return to the caller */
-	return;
-}
-
-/*
- * start_counters
- * This function starts PM-event counters on all cores
- */
-void start_counters (void)
-{
-	/* Invoke the start counter function on each core */
-	on_each_cpu (__start_counter, NULL, 0);
-
-	/* All done here */
-	return;
-}
-
-/*
  * __disable_counter
  * This function disables the performance counter on a particular core
  */
@@ -94,7 +65,9 @@ void __disable_counter (void *info)
 
 	/* Stop the perf counter */
 	cinfo->event->pmu->stop (cinfo->event, PERF_EF_UPDATE);
-	cinfo->event->pmu->del (cinfo->event, 0);
+
+	/* Stop throttling */
+	cinfo->throttled_task = NULL;
 
 	/* Return to caller */
 	return;

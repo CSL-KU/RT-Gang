@@ -29,6 +29,8 @@
 struct perfmod_info		perfmod_info;
 struct core_info __percpu	*core_info;
 int				g_period_us 			= 1000;
+int                             g_hw_counter_id                 = 0x17;
+module_param(g_hw_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
 /* Define initial event limits */
 u32				sysctl_llc_maxperf_events	= 1638400;	// 100000 MBps
@@ -71,6 +73,8 @@ int init_module (void)
 		wake_up_process (cinfo->init_thread);
 	}
 
+        pr_info("init complete. g_hw_counter_id=0x%x\n", g_hw_counter_id);
+
 	/* Initialization complete */
 	return 0;
 }
@@ -104,7 +108,7 @@ int lazy_init_thread (void *arg)
 		trace_printk ("Initialized perf counter on core (%d)\n", i);
 	}
 
-	__start_counter (NULL);
+        perf_event_enable(cinfo->event);
 
 	trace_printk ("Initialization complete on core-%2d\n", i);
 
