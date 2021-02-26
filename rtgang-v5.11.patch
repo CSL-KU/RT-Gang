@@ -138,7 +138,7 @@ index 68d369cba..d3c8cc61e 100644
   * Place new tasks ahead so that they do not starve already running
   * tasks
 diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
-index dbe4629cf..ba31ae813 100644
+index dbe4629cf..05a0d10a3 100644
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
 @@ -7,11 +7,103 @@
@@ -295,14 +295,13 @@ index dbe4629cf..ba31ae813 100644
  	set_next_task_rt(rq, p, true);
  	return p;
  }
-@@ -1642,6 +1777,16 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+@@ -1642,6 +1777,15 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
  {
  	update_curr_rt(rq);
  
 +	/* If 'prev' is a member of the current RT gang, update the
 +	 * locked_cores mask and release the RT gang lock if necessary. */
-+	if (sched_feat(RT_GANG_LOCK) && p->mm &&
-+	    (p->prio > RT_SYS_PRIO_THRESHOLD))
++	if (sched_feat(RT_GANG_LOCK))
 +	{
 +		raw_spin_lock(&rt_glock->lock);
 +		if (rt_glock->lock_held)
@@ -312,7 +311,7 @@ index dbe4629cf..ba31ae813 100644
  	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
  
  	/*
-@@ -2320,6 +2465,8 @@ void __init init_sched_rt_class(void)
+@@ -2320,6 +2464,8 @@ void __init init_sched_rt_class(void)
  		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
  					GFP_KERNEL, cpu_to_node(i));
  	}
