@@ -68,6 +68,7 @@ def main():
     ax.boxplot(items.values())
     plt.xticks(range(1, len(items.keys())+1), items.keys())
     plt.savefig('plot.pdf')
+    plt.savefig('plot.png')
     plt.show()
     
 if __name__ == "__main__":
