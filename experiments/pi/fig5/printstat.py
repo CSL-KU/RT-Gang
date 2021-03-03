@@ -5,7 +5,7 @@ import sys
 import os
 import getopt
 
-import corestats
+import numpy as np
 import matplotlib.pyplot as plt
 
 def main():
@@ -57,10 +57,10 @@ def main():
             if deadline > 0 and num > deadline:
                 deadline_miss += 1
             
-        stats = corestats.Stats(items[f])        
+        s = items[f]
         print ("%10s \t%.2f\t%.2f\t%.2f\t%.2f\t%.2f\t%5d\t%5d" %
-               (f, stats.min(), stats.avg(), stats.percentile(99), stats.max(), stats.stdev(),
-                stats.count(), deadline_miss))
+               (f, np.min(s), np.average(s), np.percentile(s, 99), np.max(s), np.std(s),
+                len(s), deadline_miss))
 
     fig, ax = plt.subplots()
     ax.set_title('Solo vs. Corun vs. RT-Gang')
