@@ -30,7 +30,13 @@ struct perfmod_info		perfmod_info;
 struct core_info __percpu	*core_info;
 int				g_period_us 			= 1000;
 int                             g_hw_counter_id                 = 0x17;
+
+#if LINUX_VERSION_CODE > KERNEL_VERSION(5, 10, 0)
 module_param(g_hw_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+#else
+module_param(g_hw_counter_id, int,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+#endif
+MODULE_PARM_DESC(g_hw_counter_id, "raw hardware counter number");
 
 /* Define initial event limits */
 u32				sysctl_llc_maxperf_events	= 1638400;	// 100000 MBps
@@ -73,8 +79,8 @@ int init_module (void)
 		wake_up_process (cinfo->init_thread);
 	}
 
-        pr_info("init complete. g_hw_counter_id=0x%x\n", g_hw_counter_id);
-
+	pr_info("init complete. g_hw_counter_id=0x%x\n", g_hw_counter_id);
+	pr_info("be_mem_threshold=%d\n", be_mem_threshold);
 	/* Initialization complete */
 	return 0;
 }
