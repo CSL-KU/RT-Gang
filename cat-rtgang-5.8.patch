@@ -1,0 +1,401 @@
+diff -ruN '--exclude=*.o*' '--exclude=*.a*' rtgang-base/kernel/sched/features.h rtgang-dev/kernel/sched/features.h
+--- rtgang-base/kernel/sched/features.h	2021-07-28 10:28:27.491340854 -0500
++++ rtgang-dev/kernel/sched/features.h	2021-07-28 11:55:50.000000000 -0500
+@@ -15,6 +15,15 @@
+ SCHED_FEAT(RT_GANG_LOCK, false)
+ 
+ /*
++ * Enable Intel Cache Allocation Technology (CAT) integration with the RT-Gang
++ * framework. Allows for the runtime altering of CAT assignments and bitmasks
++ * to improve isolation when a real-time task is running.
++ * NOTE: This feature is disabled by default.
++ * NOTE: Only works if Intel L3 CAT is supported (e.g. CONFIG_X86_CPU_RESCTRL).
++ */
++SCHED_FEAT(RT_GANG_CAT, false)
++
++/*
+  * Place new tasks ahead so that they do not starve already running
+  * tasks
+  */
+diff -ruN '--exclude=*.o*' '--exclude=*.a*' rtgang-base/kernel/sched/rt.c rtgang-dev/kernel/sched/rt.c
+--- rtgang-base/kernel/sched/rt.c	2021-07-28 10:28:27.491340854 -0500
++++ rtgang-dev/kernel/sched/rt.c	2021-08-04 18:34:20.000000000 -0500
+@@ -17,13 +17,290 @@
+ /* More than 4 hours if BW_SHIFT equals 20. */
+ static const u64 max_rt_runtime = MAX_BW;
+ 
++#ifdef CONFIG_X86_CPU_RESCTRL
++
++#define BUF_SIZE 256
++
++// Debug directory used to read/write the CLOS and bitmask values below
++static struct dentry *rtcat_dir; 
++
++// Platform dependent values
++static int num_clos = 4; // # of L3 CAT CLOSes
++static int default_bitmask = 0xfff; // # of L3 Ways (e.g. 12 => 0xfff)
++
++// CLOS and bitmasks to be used when a real-time task is launched
++static int rt_gang_clos = 1;
++static int rt_gang_bitmask = 0x3f;
++static int be_task_clos = 0;
++static int be_task_bitmask = 0xfc0;
++
++/*
++* For a given CPU value, modify its MSR value to either change its CLOS assignment
++*	or update a CLOS's resource allocations
++*/
++static inline void write_msr(u32 msr_no, u32 l, u32 h)
++{
++	if(wrmsr_safe(msr_no, l, h))
++	{
++		printk(KERN_INFO "Unable to change MSR %i\n", msr_no);
++	}
++}
++
++/*
++* For a given CPU value, modify its MSR value to either change its CLOS assignment
++*	or update a CLOS's resource allocations
++*/
++static inline void write_cpu_msr(unsigned int cpu, u32 msr_no, u32 l, u32 h)
++{
++	if(wrmsr_safe_on_cpu(cpu, msr_no, l, h))
++	{
++		printk(KERN_INFO "Unable to change MSR of cpu %i\n", cpu);
++	}
++}
++
++/* 
++ * RT-GANG CLOS ASSIGNMENT
++ */
++static ssize_t rtgang_clos_write(struct file *filp,
++				    const char __user *ubuf,
++				    size_t cnt, loff_t *ppos)
++{
++	int input;
++	char buf[BUF_SIZE];
++	char *p = buf;
++	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
++		return 0;
++
++	// Get CLOS from user and change RT CLOS accordingly
++	
++	sscanf(p, "%d", &input);
++	if (input >= 0 && input <= (num_clos-1))
++		rt_gang_clos = input;
++	else
++		pr_info("ERROR: Input should be between 0 and %d", (num_clos-1));
++		
++	return cnt;
++}
++
++// Print current RT CLOS when opened
++static int rtgang_clos_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "RT Gang CLOS: %d\n", rt_gang_clos); 
++	return 0;
++}
++static int rtgang_clos_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, rtgang_clos_show, NULL);
++}
++
++// Create ops for RT CLOS
++static const struct file_operations rtgang_clos_fops = {
++	.open		= rtgang_clos_open,
++	.write      = rtgang_clos_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++/* 
++ * RT-GANG BITMASK ASSIGNMENT
++ */
++static ssize_t rtgang_bitmask_write(struct file *filp,
++				    const char __user *ubuf,
++				    size_t cnt, loff_t *ppos)
++{
++	int input;
++	char buf[BUF_SIZE];
++	char *p = buf;
++	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
++		return 0;
++
++	// Check if input is hex value
++	if (strncmp(p, "0x", 2) == 0)
++	{
++		sscanf(p, "%x", &input);
++		if(input > default_bitmask)
++			pr_info("ERROR: Bitmask can't be larger than %x\n", default_bitmask);
++		else
++			rt_gang_bitmask = input;
++	}
++	else
++	{
++		pr_info("ERROR: Input should be hex value\n");
++		printk(KERN_INFO "ERROR: [ %s ] is not a hex value\n", p);
++	}
++	return cnt;
++}
++
++// Print current RT bitmask when opened
++static int rtgang_bitmask_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "RT Gang Bitmask: 0x%x\n", rt_gang_bitmask); 
++	return 0;
++}
++static int rtgang_bitmask_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, rtgang_bitmask_show, NULL);
++}
++
++// Create ops for RT bitmask
++static const struct file_operations rtgang_bitmask_fops = {
++	.open		= rtgang_bitmask_open,
++	.write      = rtgang_bitmask_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++
++/* 
++ * BE-TASK CLOS ASSIGNMENT
++ */
++static ssize_t betask_clos_write(struct file *filp,
++				    const char __user *ubuf,
++				    size_t cnt, loff_t *ppos)
++{
++	int cpu;
++	int input;
++	char buf[BUF_SIZE];
++	char *p = buf;
++	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
++		return 0;
++
++	// Get CLOS from user and change BE CLOS accordingly
++	sscanf(p, "%d", &input);
++	if (input >= 0 && input <= (num_clos-1))
++		be_task_clos = input;
++	else
++		pr_info("ERROR: Input should be between 0 and %d", (num_clos-1));
++		
++	// Change all other cores to the BE CLOS
++	for_each_cpu_not(cpu, rt_glock->locked_cores)
++	{
++		printk(KERN_INFO "CHANGING CORUN CLOS ON CORE %i\n", cpu);
++		write_cpu_msr(cpu, 0xc8f, 0, be_task_clos);
++	}
++		
++	return cnt;
++}
++
++// Print current BE CLOS when opened
++static int betask_clos_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "BE Task CLOS: %d\n", be_task_clos); 
++	return 0;
++}
++static int betask_clos_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, betask_clos_show, NULL);
++}
++
++// Create ops for BE CLOS
++static const struct file_operations betask_clos_fops = {
++	.open		= betask_clos_open,
++	.write      = betask_clos_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++/* 
++ * BE-TASK BITMASK ASSIGNMENT
++ */
++static ssize_t betask_bitmask_write(struct file *filp,
++				    const char __user *ubuf,
++				    size_t cnt, loff_t *ppos)
++{
++	int input;
++	char buf[BUF_SIZE];
++	char *p = buf;
++	if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
++		return 0;
++
++	// Check if input is hex value
++	if (strncmp(p, "0x", 2) == 0)
++	{
++		sscanf(p, "%x", &input);
++		if(input > default_bitmask)
++			pr_info("ERROR: Bitmask can't be larger than %x\n", default_bitmask);
++		else
++			be_task_bitmask = input;
++	}
++	else
++	{
++		pr_info("ERROR: Input should be hex value\n");
++		printk(KERN_INFO "ERROR: [ %s ] is not a hex value\n", p);
++	}
++	return cnt;
++}
++
++// Print current BE bitmask when opened
++static int betask_bitmask_show(struct seq_file *m, void *v)
++{
++	seq_printf(m, "BE Task Bitmask: 0x%x\n", be_task_bitmask); 
++	return 0;
++}
++static int betask_bitmask_open(struct inode *inode, struct file *filp)
++{
++	return single_open(filp, betask_bitmask_show, NULL);
++}
++
++// Create ops for BE bitmask
++static const struct file_operations betask_bitmask_fops = {
++	.open		= betask_bitmask_open,
++	.write      = betask_bitmask_write,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= single_release,
++};
++
++
++/*
++ * RT-Gang CAT debugfs init
++ */
++static int rtgang_cat_init_debugfs(void)
++{	
++	rtcat_dir = debugfs_create_dir("rtcat", NULL);
++	BUG_ON(!rtcat_dir);
++	debugfs_create_file("rtclos", 0444, rtcat_dir, NULL,
++			    &rtgang_clos_fops);
++	debugfs_create_file("rtbitmask", 0444, rtcat_dir, NULL,
++			    &rtgang_bitmask_fops);
++
++	debugfs_create_file("beclos", 0444, rtcat_dir, NULL,
++			    &betask_clos_fops);
++				
++	debugfs_create_file("bebitmask", 0444, rtcat_dir, NULL,
++			    &betask_bitmask_fops);			
++	return 0;
++}
++#endif /* CONFIG_X86_CPU_RESCTRL */
++
+ static inline void gang_lock_cpu(struct task_struct *thread)
+ {
++	int cpuiter;
+ 	int cpu = smp_processor_id();
+ 
+ 	TRACER(thread, "Adding new gang member");
+ 	cpumask_set_cpu(cpu, rt_glock->locked_cores);
+ 	rt_glock->gthreads [cpu] = thread;
++	
++	// If CAT partitioning is set to be used
++	if(sched_feat(RT_GANG_CAT))
++	{		
++		// If new RT task, set RT/BE CLOS resource assignments
++		if(!rt_glock->lock_held)
++		{
++			printk(KERN_INFO "CHANGING VICTIM CLOS BITMASK ON CORE %i\n", cpu);
++			write_msr((0xc90 + rt_gang_clos), rt_gang_bitmask, 0);
++			printk(KERN_INFO "CHANGING CORUN CLOS BITMASK ON CORE %i\n", cpu);
++			write_msr((0xc90 + be_task_clos), be_task_bitmask, 0);
++		}
++		
++		// Change current core to RT CLOS
++		printk(KERN_INFO "CHANGING VICTIM CORE CLOS ON CORE %i\n", cpu);
++		write_cpu_msr(cpu, 0xc8f, 0, rt_gang_clos);
++	}
+ 
+ 	return;
+ }
+@@ -65,7 +342,7 @@
+ 
+ static inline void try_glock_release(struct task_struct *thread)
+ {
+-	int cpu;
++	int cpu, cpuiter;
+ 
+ 	WARN_ON(cpumask_weight(rt_glock->locked_cores) == 0);
+ 
+@@ -77,7 +354,14 @@
+ 		if (rt_glock->gthreads [cpu] == thread) {
+ 			TRACER(thread, "Releasing lock");
+ 			WARN_ON(!rt_prio(thread->prio));
+-			cpumask_clear_cpu(cpu, rt_glock->locked_cores);
++			cpumask_clear_cpu(cpu, rt_glock->locked_cores);		
++
++			// If CAT was enabled, reset core to default CLOS
++			if(sched_feat(RT_GANG_CAT))
++			{
++				printk(KERN_INFO "RESETTING CLOS ON CORE %i\n", cpu);
++				write_cpu_msr(cpu, 0xc8f, 0, be_task_clos);
++			}
+ 		}
+ 	}
+ 
+@@ -87,6 +371,18 @@
+ 		rt_glock->prio = INT_MAX;
+ 		rt_glock->lock_held = false;
+ 		be_mem_threshold = SYS_MAX_LLC_EVENTS;
++		
++		// If CAT was enabled, reset CLOS bitmasks to entire LLC
++		//		and reassign all cores to CLOS 0
++		if(sched_feat(RT_GANG_CAT))
++		{
++			cpu = smp_processor_id();
++			printk(KERN_INFO "RESETTING RT BITMASK ON CORE %i\n", cpu);
++			write_msr((0xc90 + rt_gang_clos), default_bitmask, 0);
++			printk(KERN_INFO "RESETTING BE BITMASK ON CORE %i\n", cpu);
++			write_msr((0xc90 + be_task_clos), default_bitmask, 0);
++		}
++
+ 		resched_cpus(rt_glock->blocked_cores);
+ 		cpumask_clear(rt_glock->blocked_cores);
+ 	}
+@@ -1736,6 +2032,7 @@
+ 			BUG_ON(cpumask_weight(rt_glock->blocked_cores) != 0);
+ 
+ 			TRACER(p, "Acquiring lock");
++			printk(KERN_INFO "STARTING NEW GANG ON CORE %i\n", smp_processor_id());
+ 			rt_glock->prio = p->prio;
+ 			gang_lock_cpu(p);
+ 			rt_glock->lock_held = true;
+@@ -1745,6 +2042,7 @@
+ 			if (rt_glock->prio > p->prio) {
+ 				/* 'p' has higher priority; preempt */
+ 				TRACER(p, "Preempted by gang");
++				printk(KERN_INFO "PREEMPTING GANG ON CORE %i\n", smp_processor_id());
+ 				do_gang_preemption();
+ 				rt_glock->prio = p->prio;
+ 				gang_lock_cpu(p);
+@@ -1758,6 +2056,7 @@
+ 				if (!cpumask_test_cpu(this_cpu,
+ 					      rt_glock->blocked_cores)) {
+ 					TRACER(p, "Blocking gang");
++					printk(KERN_INFO "BLOCKING GANG ON CORE %i\n", this_cpu);
+ 					cpumask_set_cpu(this_cpu,
+ 						rt_glock->blocked_cores);
+ 				}
+@@ -1772,7 +2071,7 @@
+ }
+ 
+ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+-{
++{	
+ 	update_curr_rt(rq);
+ 
+ 	/* If 'prev' is a member of the current RT gang, update the
+@@ -2426,6 +2725,10 @@
+ 	}
+ 
+ 	INIT_GANG_LOCK();
++	
++#ifdef CONFIG_X86_CPU_RESCTRL
++	rtgang_cat_init_debugfs();
++#endif
+ }
+ #endif /* CONFIG_SMP */
+ 
