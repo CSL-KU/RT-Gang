@@ -1,0 +1,406 @@
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 77f01ac38..440577200 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -821,6 +821,9 @@ struct task_struct {
+ 
+ 	struct sched_statistics         stats;
+ 
++	/* Throttling related fields */
++	int corun_threshold_events;
++
+ #ifdef CONFIG_PREEMPT_NOTIFIERS
+ 	/* List of struct preempt_notifier: */
+ 	struct hlist_head		preempt_notifiers;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index bbbd6fac3..629376a31 100644
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@ -870,6 +870,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
+ 				      const struct iovec __user *rvec,
+ 				      unsigned long riovcnt,
+ 				      unsigned long flags);
++asmlinkage long sys_bwlock(pid_t pid, int cte);
+ asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
+ 			 unsigned long idx1, unsigned long idx2);
+ asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index abe087c53..d94a5dc20 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -627,6 +627,9 @@ __SC_COMP_3264(__NR_recvmmsg, sys_recvmmsg_time32, sys_recvmmsg, compat_sys_recv
+  */
+ #define __NR_arch_specific_syscall 244
+ 
++#define __NR_bwlock 255
++__SYSCALL(__NR_bwlock, sys_bwlock)
++
+ #if defined(__ARCH_WANT_TIME32_SYSCALLS) || __BITS_PER_LONG != 32
+ #define __NR_wait4 260
+ __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index 1f91e2c12..20b9a9e76 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -1073,6 +1073,31 @@ void resched_cpu(int cpu)
+ 	raw_spin_rq_unlock_irqrestore(rq, flags);
+ }
+ 
++/*
++ * The purpose of this function is to force rescheduling of a target cpu under
++ * all circumstances. For this reason, this function does not acquire the
++ * target CPU's rq lock and sends a rescheduling interrupt without protection
++ * if need be. It is used exclusively in RT-Gang related code.
++ */
++void resched_cpu_force (int cpu)
++{
++	struct rq *rq = cpu_rq(cpu);
++	struct task_struct *curr = rq->curr;
++
++	cpu = cpu_of(rq);
++
++	if (cpu == smp_processor_id()) {
++		set_tsk_need_resched(curr);
++		set_preempt_need_resched();
++		return;
++	}
++
++	if (set_nr_and_not_polling(curr))
++		smp_send_reschedule(cpu);
++	else
++		trace_sched_wake_idle_without_ipi(cpu);
++}
++
+ #ifdef CONFIG_SMP
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+@@ -6021,6 +6046,8 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+ 
+ 	for_each_class(class) {
+ 		p = class->pick_next_task(rq);
++		if (p == BLOCK_TASK)
++			continue;
+ 		if (p)
+ 			return p;
+ 	}
+@@ -8042,6 +8069,34 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
+ 		attr->sched_nice = task_nice(p);
+ }
+ 
++/*
++ * sys_bwlock - Memory bandwidth control lock. Provides exclusive access to
++ * main memory to the holder. Holder must be a real-time task
++ *
++ * @pid	: pid of the process which wants to hold bandwidth lock
++ * @cte : Safe memory usage threshold for corunning tasks
++ */
++SYSCALL_DEFINE2(bwlock, pid_t, pid, int, cte)
++{
++	struct task_struct *p;
++
++	/* Obtain the task structure associated with the process
++	   referenced by pid */
++	if (pid == 0 || current->pid == pid)
++		p = current;
++	else
++		p = find_process_by_pid(pid);
++
++	/* Process does not exist or it is not a real-time process */
++	if (!p || !rt_task(p))
++		return -1;
++
++	p->corun_threshold_events = cte;
++
++	/* Return with success */
++	return 0;
++}
++
+ /**
+  * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+  * @pid: the pid in question.
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index f77016823..eca1ebf26 100644
+--- a/kernel/sched/features.h
++++ b/kernel/sched/features.h
+@@ -8,6 +8,14 @@ SCHED_FEAT(PLACE_LAG, true)
+ SCHED_FEAT(PLACE_DEADLINE_INITIAL, true)
+ SCHED_FEAT(RUN_TO_PARITY, true)
+ 
++/*
++ * Enable real-time gang scheduling framework (RT-Gang). RT-Gang allows
++ * execution of a single (multi-threaded) real-time task (i.e., gang) at any
++ * giving time across all system cores.
++ * NOTE: This feature is disabled by default.
++ */
++SCHED_FEAT(RT_GANG_LOCK, false)
++
+ /*
+  * Prefer to schedule the task we woke last (assuming it failed
+  * wakeup-preemption), since its likely going to consume data we
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index 4ac36eb4c..f335e66f9 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -3,11 +3,102 @@
+  * Real-Time Scheduling Class (mapped to the SCHED_FIFO and SCHED_RR
+  * policies)
+  */
++rt_gang_lock_t	rt_gang_lock;
++rt_gang_lock_t	*rt_glock = &rt_gang_lock;
++int be_mem_threshold = SYS_MAX_LLC_EVENTS;
++EXPORT_SYMBOL(be_mem_threshold);
+ 
+ int sched_rr_timeslice = RR_TIMESLICE;
+ /* More than 4 hours if BW_SHIFT equals 20. */
+ static const u64 max_rt_runtime = MAX_BW;
+ 
++static inline void gang_lock_cpu(struct task_struct *thread)
++{
++	int cpu = smp_processor_id();
++
++	TRACER(thread, "Adding new gang member");
++	cpumask_set_cpu(cpu, rt_glock->locked_cores);
++	rt_glock->gthreads[cpu] = thread;
++
++	return;
++}
++
++static inline void resched_cpus(cpumask_var_t mask)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++
++	for_each_cpu (cpu, mask) {
++		if (cpu == this_cpu)
++			continue;
++
++		resched_cpu_force(cpu);
++	}
++	return;
++}
++
++static inline void do_gang_preemption(void)
++{
++	int cpu;
++	int this_cpu = smp_processor_id();
++
++	for_each_cpu (cpu, rt_glock->locked_cores) {
++		WARN_ON(rt_glock->gthreads[cpu] == NULL);
++		TRACER(rt_glock->gthreads[cpu], "Preempting thread");
++
++		set_tsk_need_resched(rt_glock->gthreads[cpu]);
++
++		rt_glock->gthreads[cpu] = NULL;
++		if (cpu != this_cpu)
++			resched_cpu_force(cpu);
++	}
++
++	cpumask_clear(rt_glock->locked_cores);
++
++	return;
++}
++
++static inline void try_glock_release(struct task_struct *thread)
++{
++	int cpu;
++
++	WARN_ON(cpumask_weight(rt_glock->locked_cores) == 0);
++
++	/*
++	 * Release RT-Gang lock of 'prev' task on all cores it may have ran on.
++	 * Migrated tasks can hold lock on multiple cores.
++	 */
++	for_each_cpu (cpu, rt_glock->locked_cores) {
++		if (rt_glock->gthreads[cpu] == thread) {
++			TRACER(thread, "Releasing lock");
++			WARN_ON(!rt_prio(thread->prio));
++			cpumask_clear_cpu(cpu, rt_glock->locked_cores);
++		}
++	}
++
++	if (cpumask_weight(rt_glock->locked_cores) == 0) {
++		/* RT-Gang lock is now free. Reschedule blocked cores. */
++		TRACER(thread, "Lock free");
++		rt_glock->prio = INT_MAX;
++		rt_glock->lock_held = false;
++		be_mem_threshold = SYS_MAX_LLC_EVENTS;
++		resched_cpus(rt_glock->blocked_cores);
++		cpumask_clear(rt_glock->blocked_cores);
++	}
++
++	return;
++}
++
++static inline void update_mem_threshold(struct task_struct *thread)
++{
++	if (thread->corun_threshold_events)
++		be_mem_threshold = thread->corun_threshold_events;
++	else
++		be_mem_threshold = SYS_DEFAULT_LLC_EVENTS;
++
++	return;
++}
++
+ static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
+ 
+ struct rt_bandwidth def_rt_bandwidth;
+@@ -1819,8 +1910,54 @@ static struct task_struct *pick_next_task_rt(struct rq *rq)
+ {
+ 	struct task_struct *p = pick_task_rt(rq);
+ 
+-	if (p)
+-		set_next_task_rt(rq, p, true);
++	/* If no tasks, it can be NULL */
++	if (!p)
++		return NULL;
++
++	/* Do not apply RT gang to high-priority kernel threads */
++	if (sched_feat(RT_GANG_LOCK) && p->mm &&
++		(p->prio > RT_SYS_PRIO_THRESHOLD))
++	{
++		raw_spin_lock(&rt_glock->lock);
++		if (!rt_glock->lock_held) {
++			/* No RT gang exist currently; begin a new gang */
++			BUG_ON(cpumask_weight(rt_glock->locked_cores) != 0);
++			BUG_ON(cpumask_weight(rt_glock->blocked_cores) != 0);
++
++			TRACER(p, "Acquiring lock");
++			rt_glock->prio = p->prio;
++			gang_lock_cpu(p);
++			rt_glock->lock_held = true;
++			update_mem_threshold(p);
++		} else {
++			BUG_ON(cpumask_weight(rt_glock->locked_cores) == 0);
++			if (rt_glock->prio > p->prio) {
++				/* 'p' has higher priority; preempt */
++				TRACER(p, "Preempted by gang");
++				do_gang_preemption();
++				rt_glock->prio = p->prio;
++				gang_lock_cpu(p);
++				update_mem_threshold(p);
++			} else if (p->prio == rt_glock->prio) {
++				/* 'p' is part of the current RT gang */
++				gang_lock_cpu(p);
++			} else {
++				int this_cpu = smp_processor_id();
++				/* 'p' has lower priority; blocked */
++				if (!cpumask_test_cpu(this_cpu,
++					      rt_glock->blocked_cores)) {
++					TRACER(p, "Blocking gang");
++					cpumask_set_cpu(this_cpu,
++						rt_glock->blocked_cores);
++				}
++				raw_spin_unlock(&rt_glock->lock);
++				return BLOCK_TASK;
++			}
++		}
++		raw_spin_unlock(&rt_glock->lock);
++	}
++ 
++	set_next_task_rt(rq, p, true);
+ 
+ 	return p;
+ }
+@@ -1835,6 +1972,15 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+ 
+ 	update_curr_rt(rq);
+ 
++	/* If 'prev' is a member of the current RT gang, update the
++	 * locked_cores mask and release the RT gang lock if necessary. */
++	if (sched_feat(RT_GANG_LOCK))
++	{
++		raw_spin_lock(&rt_glock->lock);
++		if (rt_glock->lock_held)
++			try_glock_release(p);
++		raw_spin_unlock(&rt_glock->lock);
++	}
+ 	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
+ 
+ 	/*
+@@ -2533,6 +2679,8 @@ void __init init_sched_rt_class(void)
+ 		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
+ 					GFP_KERNEL, cpu_to_node(i));
+ 	}
++
++	INIT_GANG_LOCK();
+ }
+ #endif /* CONFIG_SMP */
+ 
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index 048462724..a2cb529a6 100644
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -2221,6 +2221,7 @@ extern const u32		sched_prio_to_wmult[40];
+ #define ENQUEUE_INITIAL		0x80
+ 
+ #define RETRY_TASK		((void *)-1UL)
++#define BLOCK_TASK		((void *)-2UL)
+ 
+ struct affinity_context {
+ 	const struct cpumask *new_mask;
+@@ -2436,6 +2437,7 @@ extern void reweight_task(struct task_struct *p, int prio);
+ 
+ extern void resched_curr(struct rq *rq);
+ extern void resched_cpu(int cpu);
++extern void resched_cpu_force(int cpu);
+ 
+ extern struct rt_bandwidth def_rt_bandwidth;
+ extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
+@@ -3280,6 +3282,57 @@ extern int sched_dynamic_mode(const char *str);
+ extern void sched_dynamic_update(int mode);
+ #endif
+ 
++/*
++ * GANG SCHEDULING RELATED DECLARATIONS
++ */
++typedef struct rt_gang_lock {
++	raw_spinlock_t		lock;
++	bool			lock_held;
++	cpumask_var_t		locked_cores;
++	cpumask_var_t		blocked_cores;
++	int			prio;
++	struct task_struct*	gthreads[NR_CPUS];
++} rt_gang_lock_t;
++
++extern int be_mem_threshold;
++extern rt_gang_lock_t	*rt_glock;
++
++#define RT_SYS_PRIO_THRESHOLD		(50)
++#define INIT_GANG_LOCK()						\
++do {									\
++	int i = 0;							\
++	raw_spin_lock_init(&rt_glock->lock);				\
++	rt_glock->lock_held = false;					\
++	zalloc_cpumask_var(&rt_glock->locked_cores, GFP_KERNEL);	\
++	zalloc_cpumask_var(&rt_glock->blocked_cores, GFP_KERNEL);	\
++	rt_glock->prio = INT_MAX;					\
++	for (; i < NR_CPUS; i++)					\
++		rt_glock->gthreads [i] = NULL;				\
++} while (0);
++
++/*
++ * Default memory usage threshold for best-effort tasks. On a system with
++ * 64-Byte cache line size, this equals 100 GBytes/sec i.e., no throttling.
++ */
++#define	SYS_MAX_LLC_EVENTS		(1638400)
++
++/*
++ * The following budget (for using main memory) is applied by default to all
++ * best-effort tasks on a per-core basis while a real-time task is executing.
++ * On a system with 64-Byte cache line size, the value specified below comes
++ * out to be 100 MBytes/sec.
++ * The goal here is to throttle 'aggressively' by default so that the
++ * best-effort tasks are not able to interfere with the real-time tasks.
++ */
++#define	SYS_DEFAULT_LLC_EVENTS		(1638)
++
++#define RT_GANG_DEBUG
++#ifdef RT_GANG_DEBUG
++#define TRACER(task, msg)		trace_printk("[G:] %s\n", msg)
++#else
++#define TRACER(task, msg)
++#endif
++
+ static inline void update_current_exec_runtime(struct task_struct *curr,
+ 						u64 now, u64 delta_exec)
+ {
