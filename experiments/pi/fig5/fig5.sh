@@ -18,7 +18,7 @@ do_solo()
 	      -i 110 --jobs 500 --period 20 -v 1 &> /tmp/tau_1.solo
 
     sleep 5
-    mv trace.dat trace.solo
+    mv trace.dat solo.dat
     mv /tmp/*.solo .
 }
 #==============================================================================
@@ -26,7 +26,7 @@ do_solo()
 do_mint()
 {
     echo 'Co-Sched Experiment'
-    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched_features
+    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched/features
     sleep 2
 
     tau_be_mem -t 0 -c 2 -n 1 -m 1024 &> /tmp/tau_be_mem.mint &
@@ -39,7 +39,7 @@ do_mint()
     killall -s SIGTERM tau_be_mem
     killall -s SIGTERM tau_be_cpu
     sleep 5
-    mv trace.dat trace.mint
+    mv trace.dat mint.dat
     mv /tmp/*.mint .
 }
 #==============================================================================
@@ -47,7 +47,7 @@ do_mint()
 do_rtg()
 {
     echo 'RT-Gang Experiment'
-    echo RT_GANG_LOCK > /sys/kernel/debug/sched_features
+    echo RT_GANG_LOCK > /sys/kernel/debug/sched/features
 
     # AMD: 0x0964, ARM: 0x17, Intel: 0x412e 
     insmod ../../../throttling/kernel_module/exe/bwlockmod.ko g_hw_counter_id=${TH_PERF_COUNTER}
@@ -65,10 +65,10 @@ do_rtg()
     killall -s SIGTERM tau_be_mem
     killall -s SIGTERM tau_be_cpu
     sleep 5
-    mv trace.dat trace.rtg
+    mv trace.dat rtg.dat
     mv /tmp/*.rtg .
 
-    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched_features
+    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched/features
     rmmod bwlockmod
 }
 
