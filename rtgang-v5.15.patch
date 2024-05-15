@@ -1,8 +1,8 @@
 diff --git a/include/linux/sched.h b/include/linux/sched.h
-index 6e3a5eeec..ce5bfff8e 100644
+index e418935f8..3126bd8a8 100644
 --- a/include/linux/sched.h
 +++ b/include/linux/sched.h
-@@ -718,6 +718,9 @@ struct task_struct {
+@@ -803,6 +803,9 @@ struct task_struct {
  	struct uclamp_se		uclamp[UCLAMP_CNT];
  #endif
  
@@ -12,9 +12,11 @@ index 6e3a5eeec..ce5bfff8e 100644
  #ifdef CONFIG_PREEMPT_NOTIFIERS
  	/* List of struct preempt_notifier: */
  	struct hlist_head		preempt_notifiers;
+diff --git a/include/linux/syscalls.h b/include/linux/syscalls.h
+index 252243c77..97e8c72cc 100644
 --- a/include/linux/syscalls.h
 +++ b/include/linux/syscalls.h
-@@ -982,6 +982,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
+@@ -988,6 +988,7 @@ asmlinkage long sys_process_vm_writev(pid_t pid,
  				      const struct iovec __user *rvec,
  				      unsigned long riovcnt,
  				      unsigned long flags);
@@ -22,6 +24,8 @@ index 6e3a5eeec..ce5bfff8e 100644
  asmlinkage long sys_kcmp(pid_t pid1, pid_t pid2, int type,
  			 unsigned long idx1, unsigned long idx2);
  asmlinkage long sys_finit_module(int fd, const char __user *uargs, int flags);
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 1c5fb86d4..eb2ead400 100644
 --- a/include/uapi/asm-generic/unistd.h
 +++ b/include/uapi/asm-generic/unistd.h
 @@ -702,6 +702,9 @@ __SC_COMP_3264(__NR_recvmmsg, sys_recvmmsg_time32, sys_recvmmsg, compat_sys_recv
@@ -34,10 +38,12 @@ index 6e3a5eeec..ce5bfff8e 100644
  #if defined(__ARCH_WANT_TIME32_SYSCALLS) || __BITS_PER_LONG != 32
  #define __NR_wait4 260
  __SC_COMP(__NR_wait4, sys_wait4, compat_sys_wait4)
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index c1458fa8b..ea1a5004f 100644
 --- a/kernel/sched/core.c
 +++ b/kernel/sched/core.c
-@@ -633,6 +633,31 @@ void resched_cpu(int cpu)
- 	raw_spin_unlock_irqrestore(&rq->lock, flags);
+@@ -994,6 +994,31 @@ void resched_cpu(int cpu)
+ 	raw_spin_rq_unlock_irqrestore(rq, flags);
  }
  
 +/*
@@ -68,7 +74,7 @@ index 6e3a5eeec..ce5bfff8e 100644
  #ifdef CONFIG_SMP
  #ifdef CONFIG_NO_HZ_COMMON
  /*
-@@ -4909,6 +4934,8 @@ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
+@@ -5658,6 +5683,8 @@ __pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
  
  	for_each_class(class) {
  		p = class->pick_next_task(rq);
@@ -77,8 +83,8 @@ index 6e3a5eeec..ce5bfff8e 100644
  		if (p)
  			return p;
  	}
-@@ -6214,6 +6241,34 @@ static int sched_copy_attr(struct sched_attr __user *uattr, struct sched_attr *a
- 	return -E2BIG;
+@@ -7757,6 +7784,34 @@ static void get_params(struct task_struct *p, struct sched_attr *attr)
+ 		attr->sched_nice = task_nice(p);
  }
  
 +/*
@@ -112,6 +118,8 @@ index 6e3a5eeec..ce5bfff8e 100644
  /**
   * sys_sched_setscheduler - set/change the scheduler policy and RT priority
   * @pid: the pid in question.
+diff --git a/kernel/sched/features.h b/kernel/sched/features.h
+index c4947c1b5..959b3194a 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
 @@ -6,6 +6,14 @@
@@ -129,6 +137,8 @@ index 6e3a5eeec..ce5bfff8e 100644
  /*
   * Place new tasks ahead so that they do not starve already running
   * tasks
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index add67f811..7aab4186a 100644
 --- a/kernel/sched/rt.c
 +++ b/kernel/sched/rt.c
 @@ -7,11 +7,103 @@
@@ -235,10 +245,16 @@ index 6e3a5eeec..ce5bfff8e 100644
  static int do_sched_rt_period_timer(struct rt_bandwidth *rt_b, int overrun);
  
  struct rt_bandwidth def_rt_bandwidth;
-@@ -1635,8 +1727,51 @@ static struct task_struct *pick_next_task_rt(struct rq *rq)
+@@ -1661,8 +1753,54 @@ static struct task_struct *pick_next_task_rt(struct rq *rq)
  {
  	struct task_struct *p = pick_task_rt(rq);
  
+-	if (p)
+-		set_next_task_rt(rq, p, true);
++	/* If no tasks, it can be NULL */
++	if (!p)
++		return NULL;
++
 +	/* Do not apply RT gang to high-priority kernel threads */
 +	if (sched_feat(RT_GANG_LOCK) && p->mm &&
 +	    (p->prio > RT_SYS_PRIO_THRESHOLD))
@@ -281,13 +297,12 @@ index 6e3a5eeec..ce5bfff8e 100644
 +		}
 +		raw_spin_unlock(&rt_glock->lock);
 +	}
-+ 
- 	if (p)
- 		set_next_task_rt(rq, p, true);
++
++	set_next_task_rt(rq, p, true);
  
  	return p;
  }
-@@ -1642,6 +1777,15 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
+@@ -1671,6 +1809,15 @@ static void put_prev_task_rt(struct rq *rq, struct task_struct *p)
  {
  	update_curr_rt(rq);
  
@@ -303,7 +318,7 @@ index 6e3a5eeec..ce5bfff8e 100644
  	update_rt_rq_load_avg(rq_clock_pelt(rq), rq, 1);
  
  	/*
-@@ -2320,6 +2464,8 @@ void __init init_sched_rt_class(void)
+@@ -2361,6 +2508,8 @@ void __init init_sched_rt_class(void)
  		zalloc_cpumask_var_node(&per_cpu(local_cpu_mask, i),
  					GFP_KERNEL, cpu_to_node(i));
  	}
@@ -312,9 +327,11 @@ index 6e3a5eeec..ce5bfff8e 100644
  }
  #endif /* CONFIG_SMP */
  
+diff --git a/kernel/sched/sched.h b/kernel/sched/sched.h
+index e1f46ed41..c3ab354f2 100644
 --- a/kernel/sched/sched.h
 +++ b/kernel/sched/sched.h
-@@ -1810,6 +1810,7 @@ extern const u32		sched_prio_to_wmult[40];
+@@ -2117,6 +2117,7 @@ extern const u32		sched_prio_to_wmult[40];
  #endif
  
  #define RETRY_TASK		((void *)-1UL)
@@ -322,7 +339,7 @@ index 6e3a5eeec..ce5bfff8e 100644
  
  struct sched_class {
  
-@@ -2012,6 +2013,7 @@ extern void reweight_task(struct task_struct *p, int prio);
+@@ -2325,6 +2326,7 @@ extern void reweight_task(struct task_struct *p, int prio);
  
  extern void resched_curr(struct rq *rq);
  extern void resched_cpu(int cpu);
@@ -330,9 +347,8 @@ index 6e3a5eeec..ce5bfff8e 100644
  
  extern struct rt_bandwidth def_rt_bandwidth;
  extern void init_rt_bandwidth(struct rt_bandwidth *rt_b, u64 period, u64 runtime);
-@@ -2707,4 +2709,55 @@ static inline bool is_per_cpu_kthread(struct task_struct *p)
- extern int sched_dynamic_mode(const char *str);
- extern void sched_dynamic_update(int mode); 
+@@ -3102,3 +3104,54 @@ extern int sched_dynamic_mode(const char *str);
+ extern void sched_dynamic_update(int mode);
  #endif
  
 +/*
