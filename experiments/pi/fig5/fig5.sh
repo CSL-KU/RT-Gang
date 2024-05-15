@@ -8,6 +8,16 @@
 WS=192 # big: 1280 (for Intel/AMD), small=192 (for ARM)
 TH_PERF_COUNTER=0x17  # AMD: 0x0964, ARM: 0x17, Intel: 0x412e 
 
+# Scheduler features path has been changed in newer kernels
+if [ -e /sys/kernel/debug/sched/features ]; then
+    SCHED_FEATURES_PATH="/sys/kernel/debug/sched/features"
+elif [ -e /sys/kernel/debug/sched_features ]; then
+    SCHED_FEATURES_PATH="/sys/kernel/debug/sched_features"
+else
+    echo "Error: Neither sched features path exists" >&2
+    exit 1
+fi
+
 do_solo()
 {
     echo 'Solo Experiments'
@@ -26,7 +36,8 @@ do_solo()
 do_mint()
 {
     echo 'Co-Sched Experiment'
-    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched/features
+    echo NO_RT_GANG_LOCK > "$SCHED_FEATURES_PATH"
+    
     sleep 2
 
     tau_be_mem -t 0 -c 2 -n 1 -m 1024 &> /tmp/tau_be_mem.mint &
@@ -47,7 +58,7 @@ do_mint()
 do_rtg()
 {
     echo 'RT-Gang Experiment'
-    echo RT_GANG_LOCK > /sys/kernel/debug/sched/features
+    echo RT_GANG_LOCK > "$SCHED_FEATURES_PATH"
 
     # AMD: 0x0964, ARM: 0x17, Intel: 0x412e 
     insmod ../../../throttling/kernel_module/exe/bwlockmod.ko g_hw_counter_id=${TH_PERF_COUNTER}
@@ -68,7 +79,7 @@ do_rtg()
     mv trace.dat rtg.dat
     mv /tmp/*.rtg .
 
-    echo NO_RT_GANG_LOCK > /sys/kernel/debug/sched/features
+    echo NO_RT_GANG_LOCK > "$SCHED_FEATURES_PATH"
     rmmod bwlockmod
 }
 
