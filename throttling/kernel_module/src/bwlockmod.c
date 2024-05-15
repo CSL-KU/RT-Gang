@@ -42,6 +42,12 @@ MODULE_PARM_DESC(g_hw_counter_id, "raw hardware counter number");
 u32				sysctl_llc_maxperf_events	= 1638400;	// 100000 MBps
 u32				sysctl_llc_throttle_events	= 1638;		// 100 MBps
 
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+#define cpus_read_lock() get_online_cpus()
+#define cpus_read_unlock() put_online_cpus()
+#endif
+
 /**************************************************************************
  * Function Definitions
  **************************************************************************/
