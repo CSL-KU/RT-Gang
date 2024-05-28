@@ -42,6 +42,12 @@ MODULE_PARM_DESC(g_hw_counter_id, "raw hardware counter number");
 u32				sysctl_llc_maxperf_events	= 1638400;	// 100000 MBps
 u32				sysctl_llc_throttle_events	= 1638;		// 100 MBps
 
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 15, 0)
+#define cpus_read_lock() get_online_cpus()
+#define cpus_read_unlock() put_online_cpus()
+#endif
+
 /**************************************************************************
  * Function Definitions
  **************************************************************************/
@@ -62,7 +68,7 @@ int init_module (void)
 	smp_mb ();
 
 	/* Prevent state change for online CPUs */
-	get_online_cpus ();
+	cpus_read_lock();
 
 	/* Perform per-cpu initialization */
 	for_each_online_cpu (i) {
@@ -153,7 +159,7 @@ void cleanup_module (void)
 	smp_mb ();
 
 	/* Refresh the online cpu information */
-	get_online_cpus ();
+	cpus_read_lock();
 
 	/* Stop performance counters */
 	disable_counters ();
