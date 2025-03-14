@@ -17,10 +17,10 @@ echo "CPU available frequencies"
 cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
 
 echo "CPU cycle frequencies (0, 1, 2, 3)"
-cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
-cat /sys/devices/system/cpu/cpu1/cpufreq/scaling_min_freq
-cat /sys/devices/system/cpu/cpu2/cpufreq/scaling_min_freq
-cat /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq
+cat /sys/devices/system/cpu/cpu1/cpufreq/scaling_cur_freq
+cat /sys/devices/system/cpu/cpu2/cpufreq/scaling_cur_freq
+cat /sys/devices/system/cpu/cpu3/cpufreq/scaling_cur_freq
 
 echo "Throttling"
 cat /proc/sys/kernel/sched_rt_runtime_us
